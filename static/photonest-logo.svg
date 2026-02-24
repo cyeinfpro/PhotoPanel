@@ -1,0 +1,28 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="pn-bg" x1="24" y1="16" x2="226" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#80B8FF"/>
+      <stop offset="0.55" stop-color="#3A8DFF"/>
+      <stop offset="1" stop-color="#0A84FF"/>
+    </linearGradient>
+    <linearGradient id="pn-ring" x1="72" y1="70" x2="184" y2="186" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#EAF3FF" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#D9E8FF" stop-opacity="0.75"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="12" y="12" width="232" height="232" rx="64" fill="url(#pn-bg)"/>
+
+  <path d="M53 154C67 171 89 181 113 181H158C178 181 194 165 194 145C194 125 178 109 158 109H127"
+        stroke="#EAF3FF" stroke-opacity="0.8" stroke-width="12" stroke-linecap="round"/>
+  <path d="M65 136C77 149 94 157 112 157H151C164 157 175 146 175 133C175 120 164 109 151 109H136"
+        stroke="#EAF3FF" stroke-opacity="0.95" stroke-width="12" stroke-linecap="round"/>
+  <path d="M79 118C87 126 98 131 109 131H147"
+        stroke="#F5FAFF" stroke-width="12" stroke-linecap="round"/>
+
+  <circle cx="142" cy="120" r="26" fill="url(#pn-ring)"/>
+  <circle cx="142" cy="120" r="12" fill="#4D9BFF"/>
+  <circle cx="134" cy="112" r="5" fill="#F5FAFF" fill-opacity="0.86"/>
+
+  <path d="M72 74L102 56L132 74" stroke="#EAF3FF" stroke-opacity="0.95" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

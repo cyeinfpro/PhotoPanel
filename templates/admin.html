@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhotoNest 管理后台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f2f6fc;
+  --panel: rgba(255,255,255,.74);
+  --line: rgba(15,23,42,.08);
+  --text: #10203c;
+  --muted: #667894;
+  --accent: #0a84ff;
+  --ok: #10b981;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  color: var(--text);
+  font-family: "Outfit", "Noto Sans SC", sans-serif;
+  background:
+    radial-gradient(circle at 6% -10%, #d8ebff 0%, transparent 34%),
+    radial-gradient(circle at 92% 110%, #d4f7e6 0%, transparent 36%),
+    var(--bg);
+}
+.topbar {
+  position: sticky;
+  top: 8px;
+  z-index: 30;
+  margin: 12px;
+  border-radius: 22px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  backdrop-filter: blur(14px) saturate(1.1);
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.brand-logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  box-shadow: 0 8px 18px rgba(10, 132, 255, 0.25);
+}
+.title { font-size: 18px; font-weight: 650; letter-spacing: -0.02em; }
+.controls { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn {
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255,255,255,.9);
+  padding: 0 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn.primary {
+  border: none;
+  color: #fff;
+  background: linear-gradient(180deg, #1b8fff, #0a84ff);
+}
+.btn.warn {
+  border: none;
+  color: #fff;
+  background: linear-gradient(180deg, #f59e0b, #d97706);
+}
+.container {
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 0 16px 34px;
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 14px;
+}
+.card {
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--panel);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 22px 60px rgba(15,23,42,.1);
+  padding: 16px;
+}
+.card h3 { margin: 0 0 10px; font-size: 16px; }
+.muted { color: var(--muted); font-size: 12px; }
+label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+input, textarea, select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(255,255,255,.86);
+  min-height: 36px;
+  padding: 8px 10px;
+  font-size: 13px;
+  outline: none;
+}
+input:focus, textarea:focus, select:focus {
+  border-color: rgba(10,132,255,.4);
+  box-shadow: 0 0 0 3px rgba(10,132,255,.12);
+}
+textarea { min-height: 70px; resize: vertical; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+.row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }
+.row4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 10px; }
+.stack { display: flex; flex-direction: column; gap: 10px; }
+.table-wrap {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: auto;
+  max-height: 420px;
+}
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { padding: 9px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 9px;
+  font-size: 11px;
+  background: rgba(255,255,255,.86);
+}
+.dot { width: 7px; height: 7px; border-radius: 99px; background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.small-btn {
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,.9);
+  border-radius: 8px;
+  height: 28px;
+  padding: 0 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.checkbox-list {
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 8px;
+  background: rgba(255,255,255,.86);
+}
+.checkbox-list label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  margin: 0;
+  padding: 5px 2px;
+}
+.checkbox-list input { width: auto; min-height: auto; }
+.status-line { font-size: 12px; color: var(--muted); line-height: 1.6; white-space: pre-wrap; }
+#settings-card { grid-column: span 5; }
+#scan-card { grid-column: span 7; }
+#users-card { grid-column: span 6; }
+#albums-card { grid-column: span 6; }
+#acl-card { grid-column: span 12; }
+@media (max-width: 1100px) {
+  #settings-card, #scan-card, #users-card, #albums-card, #acl-card { grid-column: span 12; }
+  .row, .row3, .row4 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <img class="brand-logo" src="/static/photonest-logo.svg" alt="PhotoNest logo">
+    <div class="title">PhotoNest 管理后台</div>
+  </div>
+  <div class="controls">
+    <span class="badge"><span class="dot"></span>{{ user.username }} · 管理员</span>
+    <button class="btn" onclick="window.location.href='/'">返回相册</button>
+    <button class="btn" onclick="logout()">退出登录</button>
+  </div>
+</header>
+
+<main class="container">
+  <section class="card" id="settings-card">
+    <h3>系统设置</h3>
+    <div class="muted">路径、扫描限额、并发参数</div>
+    <div style="height:10px"></div>
+
+    <div class="stack">
+      <div>
+        <label>原图目录 (PHOTO_ROOT)</label>
+        <input id="photo_root" placeholder="/mnt/nas/photos">
+      </div>
+      <div>
+        <label>缓存目录 (CACHE_ROOT)</label>
+        <input id="cache_root" placeholder="/var/lib/photopanel/cache">
+      </div>
+
+      <div class="row3">
+        <div>
+          <label>MAX_SCAN_ALBUMS_PER_RUN</label>
+          <input id="max_scan_albums_per_run" type="number" min="1">
+        </div>
+        <div>
+          <label>MAX_SCAN_FILES_PER_ALBUM</label>
+          <input id="max_scan_files_per_album" type="number" min="10">
+        </div>
+        <div>
+          <label>MAX_NEW_THUMBS_PER_RUN</label>
+          <input id="max_new_thumbs_per_run" type="number" min="1">
+        </div>
+      </div>
+
+      <div class="row3">
+        <div>
+          <label>WORKERS</label>
+          <input id="workers" type="number" min="1" max="16">
+        </div>
+        <div>
+          <label>TIME_BUDGET_SECONDS</label>
+          <input id="time_budget_seconds" type="number" min="10">
+        </div>
+        <div>
+          <label>PREHEAT_COUNT (发布后预热)</label>
+          <input id="preheat_count" type="number" min="0">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>允许扩展名 (逗号分隔)</label>
+          <input id="allowed_extensions" placeholder=".jpg,.jpeg,.png,.webp,.heic,.heif">
+        </div>
+        <div>
+          <label>排除目录 (逗号分隔)</label>
+          <input id="exclude_dirs" placeholder="@eaDir,.git,.cache,.thumbnails">
+        </div>
+      </div>
+
+      <div>
+        <button class="btn primary" onclick="saveSettings()">保存设置</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" id="scan-card">
+    <h3>扫描任务</h3>
+    <div class="muted">支持按年份/项目定向扫描，增量索引 + 限流执行</div>
+    <div style="height:10px"></div>
+
+    <div class="row">
+      <div>
+        <label>只扫年份（逗号分隔，可空）</label>
+        <input id="scan_years" placeholder="2025,2026">
+      </div>
+      <div>
+        <label>只扫项目路径（每行一个，可空）</label>
+        <textarea id="scan_album_paths" placeholder="2025/(250110)三米徒步班"></textarea>
+      </div>
+    </div>
+
+    <div class="row">
+      <label style="display:flex;align-items:center;gap:8px;color:var(--text);margin:0;">
+        <input type="checkbox" id="scan_force" style="width:auto;min-height:auto;"> 强制全量重建（忽略目录 mtime）
+      </label>
+      <div style="text-align:right;">
+        <button class="btn warn" onclick="startScan()">启动扫描</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:8px;padding:12px;border-radius:14px;box-shadow:none;">
+      <div class="status-line" id="scan-status">加载中...</div>
+    </div>
+  </section>
+
+  <section class="card" id="users-card">
+    <h3>用户管理</h3>
+    <div class="muted">管理员可新增/编辑/禁用用户</div>
+    <div style="height:10px"></div>
+
+    <div class="row4">
+      <div>
+        <label>用户名</label>
+        <input id="new_username">
+      </div>
+      <div>
+        <label>密码 (>=6)</label>
+        <input id="new_password" type="password">
+      </div>
+      <div>
+        <label>角色</label>
+        <select id="new_role">
+          <option value="user">user</option>
+          <option value="admin">admin</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:flex-end;">
+        <button class="btn primary" style="width:100%;" onclick="createUser()">新增用户</button>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>用户名</th>
+            <th>角色</th>
+            <th>启用</th>
+            <th>新密码</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="users-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" id="albums-card">
+    <h3>相册发布</h3>
+    <div class="muted">发布后才可被普通用户访问；访问权限在下方 ACL 区配置</div>
+    <div style="height:10px"></div>
+
+    <div class="row">
+      <div>
+        <label>按年份过滤</label>
+        <input id="album_year_filter" placeholder="2025">
+      </div>
+      <div>
+        <label>按关键字过滤</label>
+        <input id="album_q_filter" placeholder="项目名或路径">
+      </div>
+    </div>
+    <div style="margin-bottom:10px;display:flex;gap:8px;">
+      <button class="btn" onclick="loadAlbums()">查询</button>
+      <button class="btn" onclick="selectFirstAlbum()">选择第一项到 ACL</button>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>项目</th>
+            <th>照片</th>
+            <th>发布</th>
+            <th>授权</th>
+          </tr>
+        </thead>
+        <tbody id="albums-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" id="acl-card">
+    <h3>ACL 授权</h3>
+    <div class="muted">为指定项目分配可见用户（普通用户）</div>
+    <div style="height:10px"></div>
+
+    <div class="row">
+      <div>
+        <label>当前项目</label>
+        <input id="acl_album" readonly placeholder="请在上方相册列表点击“授权”">
+      </div>
+      <div style="display:flex;align-items:flex-end;gap:8px;">
+        <button class="btn" onclick="selectAllAclUsers()">全选</button>
+        <button class="btn" onclick="clearAclUsers()">清空</button>
+        <button class="btn primary" onclick="saveAcl()">保存 ACL</button>
+      </div>
+    </div>
+
+    <div class="checkbox-list" id="acl-user-list"></div>
+  </section>
+</main>
+
+<script>
+const state = {
+  users: [],
+  albums: [],
+  selectedAlbumId: null,
+  selectedAlbumName: '',
+};
+
+function qs(id) { return document.getElementById(id); }
+
+async function api(path, options = {}) {
+  const res = await fetch(path, options);
+  if (res.status === 401) {
+    window.location.href = '/login';
+    throw new Error('未登录');
+  }
+  if (!res.ok) {
+    let msg = '请求失败';
+    try {
+      const data = await res.json();
+      msg = data.error || msg;
+    } catch (_e) {}
+    throw new Error(msg);
+  }
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json') ? res.json() : null;
+}
+
+async function logout() {
+  await api('/api/auth/logout', { method: 'POST' });
+  window.location.href = '/login';
+}
+
+async function loadSettings() {
+  const s = await api('/api/admin/settings');
+  const keys = [
+    'photo_root', 'cache_root', 'max_scan_albums_per_run', 'max_scan_files_per_album',
+    'max_new_thumbs_per_run', 'workers', 'time_budget_seconds', 'preheat_count',
+    'allowed_extensions', 'exclude_dirs'
+  ];
+  keys.forEach((k) => { if (qs(k)) qs(k).value = s[k] ?? ''; });
+}
+
+async function saveSettings() {
+  const payload = {
+    photo_root: qs('photo_root').value.trim(),
+    cache_root: qs('cache_root').value.trim(),
+    max_scan_albums_per_run: Number(qs('max_scan_albums_per_run').value),
+    max_scan_files_per_album: Number(qs('max_scan_files_per_album').value),
+    max_new_thumbs_per_run: Number(qs('max_new_thumbs_per_run').value),
+    workers: Number(qs('workers').value),
+    time_budget_seconds: Number(qs('time_budget_seconds').value),
+    preheat_count: Number(qs('preheat_count').value),
+    allowed_extensions: qs('allowed_extensions').value.trim(),
+    exclude_dirs: qs('exclude_dirs').value.trim(),
+  };
+
+  await api('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  alert('设置已保存');
+}
+
+async function loadUsers() {
+  const data = await api('/api/admin/users');
+  state.users = data.users || [];
+  renderUsers();
+  renderAclUserList();
+}
+
+function renderUsers() {
+  const body = qs('users-body');
+  if (!state.users.length) {
+    body.innerHTML = '<tr><td colspan="6" class="muted">暂无用户</td></tr>';
+    return;
+  }
+
+  let html = '';
+  for (const u of state.users) {
+    html += `
+      <tr>
+        <td>${u.id}</td>
+        <td><input id="u_name_${u.id}" value="${escapeHtml(u.username)}"></td>
+        <td>
+          <select id="u_role_${u.id}">
+            <option value="user" ${u.role === 'user' ? 'selected' : ''}>user</option>
+            <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>admin</option>
+          </select>
+        </td>
+        <td><input id="u_active_${u.id}" type="checkbox" ${u.active ? 'checked' : ''} style="width:auto;min-height:auto;"></td>
+        <td><input id="u_pass_${u.id}" type="password" placeholder="留空不改"></td>
+        <td><button class="small-btn" onclick="saveUser(${u.id})">保存</button></td>
+      </tr>`;
+  }
+  body.innerHTML = html;
+}
+
+async function createUser() {
+  const payload = {
+    username: qs('new_username').value.trim(),
+    password: qs('new_password').value,
+    role: qs('new_role').value,
+    active: true,
+  };
+
+  await api('/api/admin/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  qs('new_username').value = '';
+  qs('new_password').value = '';
+  qs('new_role').value = 'user';
+  await loadUsers();
+}
+
+async function saveUser(id) {
+  const payload = {
+    username: qs(`u_name_${id}`).value.trim(),
+    role: qs(`u_role_${id}`).value,
+    active: qs(`u_active_${id}`).checked,
+  };
+
+  const pass = qs(`u_pass_${id}`).value;
+  if (pass) payload.password = pass;
+
+  await api(`/api/admin/users/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  qs(`u_pass_${id}`).value = '';
+  await loadUsers();
+}
+
+async function loadAlbums() {
+  const year = qs('album_year_filter').value.trim();
+  const q = qs('album_q_filter').value.trim();
+  const params = new URLSearchParams();
+  if (year) params.set('year', year);
+  if (q) params.set('q', q);
+
+  const data = await api(`/api/admin/albums?${params.toString()}`);
+  state.albums = data.albums || [];
+  renderAlbums();
+}
+
+function renderAlbums() {
+  const body = qs('albums-body');
+  if (!state.albums.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">暂无相册，请先扫描</td></tr>';
+    return;
+  }
+
+  let html = '';
+  for (const a of state.albums) {
+    html += `
+      <tr>
+        <td>${a.id}</td>
+        <td>
+          <div><strong>${escapeHtml(a.name)}</strong></div>
+          <div class="muted">${escapeHtml(a.rel_path)}</div>
+        </td>
+        <td>${a.photo_count}</td>
+        <td>
+          <label style="display:flex;align-items:center;gap:8px;color:var(--text);">
+            <input type="checkbox" style="width:auto;min-height:auto;" ${a.published ? 'checked' : ''}
+              onchange="togglePublish(${a.id}, this.checked)">
+            ${a.published ? '已发布' : '未发布'}
+          </label>
+        </td>
+        <td>
+          <button class="small-btn" onclick="selectAlbumForAcl(${a.id})">授权</button>
+        </td>
+      </tr>`;
+  }
+  body.innerHTML = html;
+}
+
+async function togglePublish(albumId, published) {
+  try {
+    await api(`/api/admin/albums/${albumId}/publish`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ published }),
+    });
+  } catch (e) {
+    alert(`发布状态更新失败: ${e.message}`);
+  }
+  await loadAlbums();
+}
+
+function selectFirstAlbum() {
+  if (!state.albums.length) return;
+  selectAlbumForAcl(state.albums[0].id);
+}
+
+function selectAlbumForAcl(albumId) {
+  const album = state.albums.find(a => a.id === albumId);
+  if (!album) return;
+
+  state.selectedAlbumId = album.id;
+  state.selectedAlbumName = `${album.rel_path} (#${album.id})`;
+  qs('acl_album').value = state.selectedAlbumName;
+
+  renderAclUserList(album.acl_user_ids || []);
+}
+
+function renderAclUserList(selectedIds = null) {
+  const list = qs('acl-user-list');
+  const selected = new Set(selectedIds !== null
+    ? selectedIds
+    : (state.albums.find(a => a.id === state.selectedAlbumId)?.acl_user_ids || []));
+
+  const normalUsers = state.users.filter(u => u.role === 'user' && u.active);
+  if (!normalUsers.length) {
+    list.innerHTML = '<div class="muted">暂无可分配的普通用户</div>';
+    return;
+  }
+
+  let html = '';
+  for (const u of normalUsers) {
+    html += `
+      <label>
+        <input type="checkbox" value="${u.id}" ${selected.has(u.id) ? 'checked' : ''}>
+        <span>${escapeHtml(u.username)} (ID: ${u.id})</span>
+      </label>`;
+  }
+
+  list.innerHTML = html;
+}
+
+function getSelectedAclUserIds() {
+  const ids = [];
+  qs('acl-user-list').querySelectorAll('input[type="checkbox"]:checked').forEach((el) => {
+    ids.push(Number(el.value));
+  });
+  return ids;
+}
+
+function selectAllAclUsers() {
+  qs('acl-user-list').querySelectorAll('input[type="checkbox"]').forEach((el) => { el.checked = true; });
+}
+
+function clearAclUsers() {
+  qs('acl-user-list').querySelectorAll('input[type="checkbox"]').forEach((el) => { el.checked = false; });
+}
+
+async function saveAcl() {
+  if (!state.selectedAlbumId) {
+    alert('请先在上方相册列表中点击“授权”选择项目');
+    return;
+  }
+
+  const user_ids = getSelectedAclUserIds();
+  await api(`/api/admin/albums/${state.selectedAlbumId}/acl`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_ids }),
+  });
+
+  await loadAlbums();
+  selectAlbumForAcl(state.selectedAlbumId);
+  alert('ACL 已保存');
+}
+
+async function startScan() {
+  const years = qs('scan_years').value
+    .split(',')
+    .map(v => v.trim())
+    .filter(Boolean);
+
+  const album_paths = qs('scan_album_paths').value
+    .split('\n')
+    .map(v => v.trim())
+    .filter(Boolean);
+
+  const force = qs('scan_force').checked;
+
+  await api('/api/admin/albums/scan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ years, album_paths, force }),
+  });
+
+  await loadScanStatus();
+}
+
+async function loadScanStatus() {
+  const s = await api('/api/admin/scan-status');
+  const lines = [];
+  lines.push(`状态: ${s.message || 'unknown'}${s.running ? ' (running)' : ''}`);
+  lines.push(`开始: ${s.started_at ? new Date(s.started_at * 1000).toLocaleString() : '-'}`);
+  lines.push(`结束: ${s.finished_at ? new Date(s.finished_at * 1000).toLocaleString() : '-'}`);
+  lines.push(`处理项目: ${s.processed_albums || 0}，跳过项目: ${s.skipped_albums || 0}`);
+  lines.push(`扫描文件: ${s.scanned_files || 0}，更新文件: ${s.updated_files || 0}，删除文件: ${s.deleted_files || 0}`);
+  lines.push(`生成缓存对: ${s.generated_cache_pairs || 0}`);
+  if (s.stop_reason) lines.push(`停止原因: ${s.stop_reason}`);
+  if (s.last_scan_summary && Object.keys(s.last_scan_summary).length) {
+    lines.push('最近任务摘要:');
+    lines.push(JSON.stringify(s.last_scan_summary, null, 2));
+  }
+
+  qs('scan-status').textContent = lines.join('\n');
+}
+
+function escapeHtml(v) {
+  return String(v)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+async function init() {
+  try {
+    await Promise.all([loadSettings(), loadUsers(), loadAlbums(), loadScanStatus()]);
+  } catch (e) {
+    alert(`初始化失败: ${e.message}`);
+  }
+
+  setInterval(() => {
+    loadScanStatus().catch(() => {});
+  }, 5000);
+}
+
+init();
+</script>
+</body>
+</html>

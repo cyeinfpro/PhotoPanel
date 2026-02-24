@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhotoNest</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f2f5fb;
+  --panel: rgba(255, 255, 255, 0.72);
+  --surface: rgba(255, 255, 255, 0.88);
+  --line: rgba(21, 32, 58, 0.09);
+  --line-strong: rgba(21, 32, 58, 0.16);
+  --text: #0e1a31;
+  --muted: #66758e;
+  --accent: #0a84ff;
+  --accent-soft: rgba(10, 132, 255, 0.14);
+  --ok: #10b981;
+  --warn: #f59e0b;
+  --radius-xl: 26px;
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --shadow: 0 18px 50px rgba(15, 30, 64, 0.13);
+  --shadow-card: 0 12px 26px rgba(15, 30, 64, 0.08);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  color: var(--text);
+  font-family: "Outfit", "Noto Sans SC", sans-serif;
+  background:
+    radial-gradient(1000px 500px at -15% -10%, #d6ebff 0%, transparent 62%),
+    radial-gradient(1100px 580px at 120% 110%, #d7f8e8 0%, transparent 65%),
+    linear-gradient(180deg, #f7f9fd 0%, #eef3fb 100%);
+  min-height: 100vh;
+}
+
+.shell {
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 14px 18px 38px;
+}
+
+.topbar {
+  position: sticky;
+  top: 12px;
+  z-index: 30;
+  border-radius: 22px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  backdrop-filter: blur(14px) saturate(1.15);
+  box-shadow: var(--shadow);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+
+.brand-logo {
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  box-shadow: 0 8px 18px rgba(10, 132, 255, 0.24);
+  flex-shrink: 0;
+}
+
+.brand-title {
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.brand-sub {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: -1px;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.search {
+  height: 38px;
+  width: min(260px, 46vw);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.92);
+  padding: 0 14px;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+}
+
+.search:focus {
+  border-color: rgba(10, 132, 255, 0.4);
+  box-shadow: 0 0 0 4px rgba(10, 132, 255, 0.11);
+}
+
+.badge {
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 11px;
+  white-space: nowrap;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  display: inline-block;
+  margin-right: 6px;
+  background: var(--ok);
+}
+
+.btn {
+  height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.92);
+  color: var(--text);
+  padding: 0 13px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 7px 16px rgba(15, 30, 64, 0.1);
+  border-color: var(--line-strong);
+}
+
+.btn.primary {
+  border: none;
+  color: white;
+  background: linear-gradient(180deg, #2494ff, #0a84ff);
+}
+
+.btn.primary:hover {
+  box-shadow: 0 10px 20px rgba(10, 132, 255, 0.28);
+}
+
+.content-wrap {
+  margin-top: 16px;
+}
+
+.breadcrumb {
+  margin: 0 2px 12px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.breadcrumb .clickable {
+  cursor: pointer;
+  color: #22324f;
+}
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xl);
+  background: var(--panel);
+  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow);
+  padding: 18px;
+}
+
+.panel-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.title {
+  font-size: 29px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.08;
+}
+
+.subtitle {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.grid {
+  display: grid;
+  gap: 14px;
+}
+
+.grid.years {
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+}
+
+.grid.albums {
+  grid-template-columns: repeat(auto-fill, minmax(245px, 1fr));
+}
+
+.card {
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  cursor: pointer;
+  transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+}
+
+.card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 18px 32px rgba(15, 30, 64, 0.14);
+  border-color: var(--line-strong);
+}
+
+.cover {
+  background:
+    linear-gradient(140deg, #eef5ff, #f8fbff),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(255, 255, 255, 0.84));
+  border-bottom: 1px solid var(--line);
+  min-height: 140px;
+  position: relative;
+  padding: 8px;
+}
+
+.cover img {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 12px;
+  object-fit: contain;
+}
+
+.cover-placeholder {
+  min-height: 124px;
+  border-radius: 12px;
+  border: 1px dashed rgba(45, 79, 140, 0.22);
+  display: grid;
+  place-items: center;
+  color: #7b8ba7;
+  font-size: 13px;
+}
+
+.tag {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  padding: 5px 9px;
+  font-size: 11px;
+  border-radius: 999px;
+  color: white;
+  backdrop-filter: blur(5px);
+}
+
+.card-body {
+  padding: 12px 12px 14px;
+}
+
+.name {
+  font-size: 14px;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.photo-masonry {
+  column-count: 5;
+  column-gap: 12px;
+}
+
+.photo-tile {
+  break-inside: avoid;
+  margin-bottom: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  cursor: pointer;
+  transition: transform .18s ease, box-shadow .18s ease;
+}
+
+.photo-tile:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 28px rgba(15, 30, 64, 0.12);
+}
+
+.photo-frame {
+  background: linear-gradient(145deg, #f3f8ff, #fbfcff);
+  border-bottom: 1px solid var(--line);
+}
+
+.photo-frame img {
+  width: 100%;
+  height: auto;
+  display: block;
+  object-fit: contain;
+}
+
+.photo-meta {
+  padding: 8px 9px 9px;
+}
+
+.photo-filename {
+  font-size: 12px;
+  font-weight: 500;
+  color: #1e2b44;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.photo-size {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.load-more {
+  margin-top: 14px;
+  text-align: center;
+}
+
+.empty {
+  text-align: center;
+  padding: 58px 20px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  display: none;
+  background: rgba(9, 13, 22, 0.93);
+  backdrop-filter: blur(14px);
+}
+
+.lightbox.show {
+  display: flex;
+}
+
+.lb-main {
+  margin: auto;
+  width: min(94vw, 1500px);
+  height: min(94vh, 980px);
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 10px;
+}
+
+.lb-head {
+  color: rgba(255, 255, 255, 0.92);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.lb-title {
+  font-size: 14px;
+}
+
+.lb-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.lb-btn {
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  border-radius: 10px;
+  height: 34px;
+  padding: 0 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.lb-stage {
+  position: relative;
+  border-radius: 18px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+  display: grid;
+  place-items: center;
+}
+
+.lb-stage img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.lb-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 42px;
+  height: 42px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  color: white;
+  font-size: 24px;
+  cursor: pointer;
+}
+
+.lb-nav.prev { left: 12px; }
+.lb-nav.next { right: 12px; }
+
+@media (max-width: 1400px) {
+  .photo-masonry { column-count: 4; }
+}
+
+@media (max-width: 1100px) {
+  .photo-masonry { column-count: 3; }
+}
+
+@media (max-width: 820px) {
+  .shell { padding: 10px 10px 28px; }
+  .topbar { top: 8px; }
+  .panel { padding: 13px; }
+  .title { font-size: 23px; }
+  .search { width: min(190px, 56vw); }
+  .photo-masonry { column-count: 2; }
+}
+
+@media (max-width: 560px) {
+  .controls { gap: 7px; }
+  .photo-masonry { column-count: 1; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand-logo" src="/static/photonest-logo.svg" alt="PhotoNest logo">
+      <div>
+        <div class="brand-title">PhotoNest</div>
+        <div class="brand-sub">Private Gallery</div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <input id="search" class="search" placeholder="搜索项目名（如 徒步班 / 250110）">
+      <span class="badge" id="stats">加载中...</span>
+      <span class="badge"><span class="status-dot"></span><span id="user-info"></span></span>
+      <button id="admin-btn" class="btn" style="display:none;" onclick="goAdmin()">管理后台</button>
+      <button id="refresh-btn" class="btn" style="display:none;" onclick="triggerScan()">增量扫描</button>
+      <button id="logout-btn" class="btn" onclick="logout()">退出</button>
+    </div>
+  </header>
+
+  <div class="content-wrap">
+    <div class="breadcrumb" id="breadcrumb"></div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <div class="title" id="title">PhotoNest</div>
+          <div class="subtitle" id="subtitle"></div>
+        </div>
+      </div>
+      <div id="content"></div>
+    </section>
+  </div>
+</div>
+
+<div class="lightbox" id="lightbox">
+  <div class="lb-main">
+    <div class="lb-head">
+      <div class="lb-title" id="lb-title"></div>
+      <div class="lb-actions">
+        <button class="lb-btn" onclick="downloadCurrent()">下载原图</button>
+        <button class="lb-btn" onclick="closeLightbox()">关闭</button>
+      </div>
+    </div>
+    <div class="lb-stage" id="lb-stage">
+      <button class="lb-nav prev" onclick="stepLightbox(-1)">&#8249;</button>
+      <img id="lb-img" alt="preview">
+      <button class="lb-nav next" onclick="stepLightbox(1)">&#8250;</button>
+    </div>
+    <div class="lb-head">
+      <div class="lb-title" id="lb-counter"></div>
+      <div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const CURRENT_USER = {{ user | tojson }};
+
+const state = {
+  view: 'years',
+  year: '',
+  albumId: null,
+  albumName: '',
+  years: [],
+  albums: [],
+  photos: [],
+  page: 1,
+  pageSize: 200,
+  hasMore: false,
+  loading: false,
+  query: '',
+  lightboxIndex: -1,
+};
+
+function qs(id) { return document.getElementById(id); }
+
+async function api(path, options = {}) {
+  const res = await fetch(path, options);
+  if (res.status === 401) {
+    window.location.href = '/login';
+    throw new Error('未登录');
+  }
+  if (!res.ok) {
+    let msg = '请求失败';
+    try {
+      const data = await res.json();
+      msg = data.error || msg;
+    } catch (_e) {}
+    throw new Error(msg);
+  }
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) return res.json();
+  return null;
+}
+
+function goAdmin() { window.location.href = '/admin'; }
+
+async function logout() {
+  await api('/api/auth/logout', { method: 'POST' });
+  window.location.href = '/login';
+}
+
+function updateHeader() {
+  qs('user-info').textContent = `${CURRENT_USER.username} · ${CURRENT_USER.role === 'admin' ? '管理员' : '用户'}`;
+  if (CURRENT_USER.role === 'admin') {
+    qs('admin-btn').style.display = 'inline-flex';
+    qs('refresh-btn').style.display = 'inline-flex';
+  }
+}
+
+function updateBreadcrumb() {
+  const bc = [];
+  bc.push(`<span class="clickable" onclick="openYears()">全部年份</span>`);
+  if (state.year) {
+    bc.push('›');
+    bc.push(`<span class="clickable" onclick="openYear(${JSON.stringify(state.year)})">${state.year}</span>`);
+  }
+  if (state.albumId) {
+    bc.push('›');
+    bc.push(`<span>${escapeHtml(state.albumName || '相册')}</span>`);
+  }
+  qs('breadcrumb').innerHTML = bc.join(' ');
+}
+
+function setTitle(title, subtitle) {
+  qs('title').textContent = title;
+  qs('subtitle').textContent = subtitle || '';
+}
+
+function escapeHtml(v) {
+  return String(v)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+async function loadStats() {
+  try {
+    const s = await api('/api/stats');
+    qs('stats').textContent = `${s.albums} 个项目 · ${s.photos.toLocaleString()} 张 · ${s.total_size_gb} GB`;
+  } catch (_e) {
+    qs('stats').textContent = '统计加载失败';
+  }
+}
+
+function renderEmpty(msg) {
+  qs('content').innerHTML = `<div class="empty">${escapeHtml(msg)}</div>`;
+}
+
+function placeholder(text) {
+  return `<div class="cover-placeholder">${escapeHtml(text)}</div>`;
+}
+
+async function openYears() {
+  state.view = 'years';
+  state.year = '';
+  state.albumId = null;
+  state.albumName = '';
+  updateBreadcrumb();
+  setTitle('年份', '按年份浏览已索引项目');
+
+  qs('content').innerHTML = '<div class="empty">正在加载...</div>';
+  const data = await api('/api/years');
+  state.years = data.years || [];
+
+  if (!state.years.length) {
+    renderEmpty('暂无可见项目。请让管理员先扫描并发布相册。');
+    updateHash();
+    return;
+  }
+
+  let html = '<div class="grid years">';
+  for (const y of state.years) {
+    const cover = y.cover_photo_id ? `/api/thumb/${y.cover_photo_id}` : '';
+    html += `
+      <article class="card" onclick="openYear(${JSON.stringify(y.year)})">
+        <div class="cover">
+          ${cover ? `<img loading="lazy" src="${cover}" alt="${escapeHtml(y.year)}">` : placeholder('无封面')}
+        </div>
+        <div class="card-body">
+          <div class="name">${escapeHtml(y.year)}</div>
+          <div class="meta">${y.albums} 个项目 · ${Number(y.photos).toLocaleString()} 张</div>
+        </div>
+      </article>`;
+  }
+  html += '</div>';
+  qs('content').innerHTML = html;
+  updateHash();
+}
+
+async function openYear(year) {
+  state.view = 'albums';
+  state.year = year;
+  state.albumId = null;
+  state.albumName = '';
+  updateBreadcrumb();
+  const subtitle = state.query ? `搜索 “${state.query}”` : `年份 ${year}`;
+  setTitle(year, subtitle);
+
+  qs('content').innerHTML = '<div class="empty">正在加载...</div>';
+  const query = new URLSearchParams();
+  query.set('year', year);
+  if (state.query) query.set('q', state.query);
+
+  const data = await api(`/api/albums?${query.toString()}`);
+  state.albums = data.albums || [];
+
+  if (!state.albums.length) {
+    renderEmpty('当前条件下没有相册。');
+    updateHash();
+    return;
+  }
+
+  let html = '<div class="grid albums">';
+  for (const a of state.albums) {
+    const cover = `/api/cover/${a.id}`;
+    const publishTag = CURRENT_USER.role === 'admin'
+      ? `<span class="tag" style="background:${a.published ? 'rgba(16,185,129,.86)' : 'rgba(245,158,11,.86)'};">${a.published ? '已发布' : '未发布'}</span>`
+      : '';
+
+    html += `
+      <article class="card" onclick="openAlbum(${a.id}, ${JSON.stringify(a.name)})">
+        <div class="cover">
+          <img loading="lazy" src="${cover}" alt="${escapeHtml(a.name)}">
+          ${publishTag}
+        </div>
+        <div class="card-body">
+          <div class="name">${escapeHtml(a.name)}</div>
+          <div class="meta">${a.photo_count} 张 · ${escapeHtml(a.rel_path)}</div>
+        </div>
+      </article>`;
+  }
+  html += '</div>';
+  qs('content').innerHTML = html;
+  updateHash();
+}
+
+async function openAlbum(albumId, albumName) {
+  state.view = 'photos';
+  state.albumId = albumId;
+  state.albumName = albumName || '';
+  state.photos = [];
+  state.page = 1;
+  state.hasMore = false;
+  updateBreadcrumb();
+  setTitle(state.albumName || '相册', '正在加载照片...');
+
+  qs('content').innerHTML = '<div class="empty">正在加载...</div>';
+  await loadPhotoPage(true);
+  updateHash();
+}
+
+async function loadPhotoPage(reset = false) {
+  if (state.loading || !state.albumId) return;
+  state.loading = true;
+
+  try {
+    const q = new URLSearchParams({
+      album_id: String(state.albumId),
+      page: String(state.page),
+      page_size: String(state.pageSize),
+    });
+
+    const data = await api(`/api/photos?${q.toString()}`);
+
+    if (reset) {
+      state.photos = [];
+      qs('content').innerHTML = '<div class="photo-masonry" id="photo-grid"></div><div class="load-more" id="load-more"></div>';
+    }
+
+    state.photos = state.photos.concat(data.photos || []);
+    state.hasMore = !!data.has_more;
+    state.albumName = data.album?.name || state.albumName;
+
+    setTitle(state.albumName || '相册', `${data.total} 张照片（原比例展示）`);
+    updateBreadcrumb();
+
+    const grid = qs('photo-grid');
+    for (const p of data.photos || []) {
+      const tile = document.createElement('article');
+      tile.className = 'photo-tile';
+      tile.onclick = () => openLightboxById(p.id);
+      tile.innerHTML = `
+        <div class="photo-frame">
+          <img loading="lazy" src="/api/thumb/${p.id}" alt="${escapeHtml(p.filename)}">
+        </div>
+        <div class="photo-meta">
+          <div class="photo-filename">${escapeHtml(p.filename)}</div>
+          <div class="photo-size">${Number(p.size_mb).toFixed(2)} MB</div>
+        </div>
+      `;
+      grid.appendChild(tile);
+    }
+
+    const more = qs('load-more');
+    if (state.hasMore) {
+      more.innerHTML = '<button class="btn primary" onclick="loadMorePhotos()">加载更多</button>';
+    } else {
+      more.innerHTML = '<span class="badge">已加载全部照片</span>';
+    }
+  } finally {
+    state.loading = false;
+  }
+}
+
+function loadMorePhotos() {
+  state.page += 1;
+  loadPhotoPage(false);
+}
+
+function openLightboxById(photoId) {
+  const idx = state.photos.findIndex(p => p.id === photoId);
+  if (idx < 0) return;
+  state.lightboxIndex = idx;
+  qs('lightbox').classList.add('show');
+  document.body.style.overflow = 'hidden';
+  renderLightbox();
+}
+
+function closeLightbox() {
+  qs('lightbox').classList.remove('show');
+  document.body.style.overflow = '';
+}
+
+function stepLightbox(delta) {
+  if (!state.photos.length) return;
+  state.lightboxIndex = (state.lightboxIndex + delta + state.photos.length) % state.photos.length;
+  renderLightbox();
+}
+
+function renderLightbox() {
+  const p = state.photos[state.lightboxIndex];
+  if (!p) return;
+  qs('lb-img').src = `/api/preview/${p.id}`;
+  qs('lb-title').textContent = p.filename;
+  qs('lb-counter').textContent = `${state.lightboxIndex + 1} / ${state.photos.length}`;
+}
+
+function downloadCurrent() {
+  const p = state.photos[state.lightboxIndex];
+  if (!p) return;
+  window.open(`/api/download/${p.id}`, '_blank');
+}
+
+async function triggerScan() {
+  if (CURRENT_USER.role !== 'admin') return;
+  const button = qs('refresh-btn');
+  button.disabled = true;
+  button.textContent = '扫描中...';
+  try {
+    await api('/api/admin/albums/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: false })
+    });
+    setTimeout(loadStats, 1200);
+  } catch (e) {
+    alert(`扫描启动失败: ${e.message}`);
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = '增量扫描';
+    }, 2000);
+  }
+}
+
+function updateHash() {
+  if (state.view === 'years') {
+    history.replaceState(null, '', '#/years');
+  } else if (state.view === 'albums') {
+    history.replaceState(null, '', `#/year/${encodeURIComponent(state.year)}`);
+  } else if (state.view === 'photos') {
+    history.replaceState(null, '', `#/album/${state.albumId}`);
+  }
+}
+
+async function restoreFromHash() {
+  const hash = location.hash.replace('#', '');
+  if (!hash || hash === '/years') {
+    await openYears();
+    return;
+  }
+
+  const parts = hash.split('/').filter(Boolean);
+  if (parts[0] === 'year' && parts[1]) {
+    await openYear(decodeURIComponent(parts[1]));
+    return;
+  }
+
+  if (parts[0] === 'album' && parts[1]) {
+    const albumId = Number(parts[1]);
+    if (!Number.isFinite(albumId) || albumId <= 0) {
+      await openYears();
+      return;
+    }
+    await openAlbum(albumId, '相册');
+    return;
+  }
+
+  await openYears();
+}
+
+function bindEvents() {
+  qs('search').addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      state.query = e.target.value.trim();
+      if (state.view === 'albums' && state.year) {
+        await openYear(state.year);
+      }
+    }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    const showing = qs('lightbox').classList.contains('show');
+    if (!showing) return;
+    if (e.key === 'Escape') closeLightbox();
+    if (e.key === 'ArrowLeft') stepLightbox(-1);
+    if (e.key === 'ArrowRight') stepLightbox(1);
+    if (e.key.toLowerCase() === 'd') downloadCurrent();
+  });
+}
+
+(async function init() {
+  updateHeader();
+  bindEvents();
+  await loadStats();
+  await restoreFromHash();
+})();
+</script>
+</body>
+</html>
