@@ -113,6 +113,11 @@ app.config["JSON_AS_ASCII"] = False
 
 scan_lock = threading.Lock()
 scan_status_lock = threading.Lock()
+runtime_settings_lock = threading.Lock()
+runtime_settings_cache = None
+runtime_settings_cache_expires_at = 0.0
+RUNTIME_SETTINGS_CACHE_TTL = float(os.environ.get("SETTINGS_CACHE_TTL_SECONDS", "5"))
+
 scan_status = {
     "running": False,
     "started_at": None,
@@ -121,6 +126,7 @@ scan_status = {
     "message": "idle",
     "processed_albums": 0,
     "skipped_albums": 0,
+    "visited_albums": 0,
     "scanned_files": 0,
     "updated_files": 0,
     "deleted_files": 0,
@@ -268,14 +274,38 @@ def set_setting(key, value):
             """,
             (key, str(value)),
         )
+    invalidate_runtime_settings_cache()
 
 
-def get_runtime_settings():
+def invalidate_runtime_settings_cache():
+    global runtime_settings_cache, runtime_settings_cache_expires_at
+    with runtime_settings_lock:
+        runtime_settings_cache = None
+        runtime_settings_cache_expires_at = 0.0
+
+
+def get_runtime_settings(force_refresh=False):
+    global runtime_settings_cache, runtime_settings_cache_expires_at
+    now = time.time()
+
+    with runtime_settings_lock:
+        if (
+            not force_refresh
+            and runtime_settings_cache is not None
+            and now < runtime_settings_cache_expires_at
+        ):
+            return dict(runtime_settings_cache)
+
     with get_db_conn() as conn:
         rows = conn.execute("SELECT key, value FROM settings").fetchall()
     values = {r["key"]: r["value"] for r in rows}
     merged = dict(DEFAULT_SETTINGS)
     merged.update(values)
+
+    with runtime_settings_lock:
+        runtime_settings_cache = dict(merged)
+        runtime_settings_cache_expires_at = time.time() + max(1.0, RUNTIME_SETTINGS_CACHE_TTL)
+
     return merged
 
 
@@ -437,7 +467,8 @@ def cover_file_path(cache_root, album_rel_path):
 
 def encode_webp_with_budget(image, target_path, quality, min_quality, target_kb, method):
     target_bytes = max(0, int(target_kb) * 1024)
-    tmp_path = Path(str(target_path) + ".tmp")
+    tmp_suffix = f".tmp.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
+    tmp_path = Path(str(target_path) + tmp_suffix)
     current_quality = max(min_quality, quality)
     encoded_size = 0
 
@@ -794,7 +825,8 @@ def preheat_worker(task):
         _, g1 = ensure_cached_variant(rel_path, src_mtime, "thumb")
         _, g2 = ensure_cached_variant(rel_path, src_mtime, "preview")
         generated = g1 or g2
-    except Exception:
+    except Exception as exc:
+        logger.warning("Preheat failed for %s: %s", rel_path, exc)
         generated = False
     return photo_id, src_mtime, generated
 
@@ -824,6 +856,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
         message="running",
         processed_albums=0,
         skipped_albums=0,
+        visited_albums=0,
         scanned_files=0,
         updated_files=0,
         deleted_files=0,
@@ -862,6 +895,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
 
         processed_albums = 0
         skipped_albums = 0
+        visited_albums = 0
         scanned_files = 0
         updated_files = 0
         deleted_files = 0
@@ -874,16 +908,24 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
 
         with get_db_conn() as conn:
             for year, album_name, rel_path, album_path in albums:
-                if processed_albums >= max_scan_albums:
+                if visited_albums >= max_scan_albums:
                     stop_reason = "max_scan_albums_per_run"
                     break
                 if time.time() - start >= time_budget:
                     stop_reason = "time_budget_seconds"
                     break
 
+                visited_albums += 1
+
                 try:
                     dir_mtime = album_path.stat().st_mtime
                 except OSError:
+                    skipped_albums += 1
+                    set_scan_status(
+                        processed_albums=processed_albums,
+                        skipped_albums=skipped_albums,
+                        visited_albums=visited_albums,
+                    )
                     continue
 
                 album_id, is_published, old_dir_mtime = upsert_album(
@@ -892,6 +934,11 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
 
                 if not force and old_dir_mtime == dir_mtime:
                     skipped_albums += 1
+                    set_scan_status(
+                        processed_albums=processed_albums,
+                        skipped_albums=skipped_albums,
+                        visited_albums=visited_albums,
+                    )
                     continue
 
                 res = index_single_album(
@@ -925,6 +972,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
                 set_scan_status(
                     processed_albums=processed_albums,
                     skipped_albums=skipped_albums,
+                    visited_albums=visited_albums,
                     scanned_files=scanned_files,
                     updated_files=updated_files,
                     deleted_files=deleted_files,
@@ -962,6 +1010,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
                 "found_albums": len(albums),
                 "processed_albums": processed_albums,
                 "skipped_albums": skipped_albums,
+                "visited_albums": visited_albums,
                 "scanned_files": scanned_files,
                 "updated_files": updated_files,
                 "deleted_files": deleted_files,
@@ -981,6 +1030,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
             message="completed" if not stop_reason else "completed_with_limit",
             processed_albums=processed_albums,
             skipped_albums=skipped_albums,
+            visited_albums=visited_albums,
             scanned_files=scanned_files,
             updated_files=updated_files,
             deleted_files=deleted_files,
@@ -1491,7 +1541,9 @@ def admin_scan_status():
         status["last_scan_summary"] = {}
 
     scan_total = int(status.get("scan_target_albums") or 0)
-    scan_done = int(status.get("processed_albums") or 0) + int(status.get("skipped_albums") or 0)
+    scan_done = int(status.get("visited_albums") or 0)
+    if scan_done <= 0:
+        scan_done = int(status.get("processed_albums") or 0) + int(status.get("skipped_albums") or 0)
     scan_progress_pct = 0
     if scan_total > 0:
         scan_progress_pct = min(100, int((scan_done / scan_total) * 100))

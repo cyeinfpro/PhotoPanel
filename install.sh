@@ -81,8 +81,14 @@ if [[ ! -d "${APP_DIR}/.git" ]]; then
   rm -rf "${APP_DIR}"
   git clone "${REPO_URL}" "${APP_DIR}"
 else
-  git -C "${APP_DIR}" fetch --all
-  git -C "${APP_DIR}" pull --ff-only
+  if ! git -C "${APP_DIR}" fetch --all || ! git -C "${APP_DIR}" pull --ff-only; then
+    echo "现有代码更新失败，改为重新拉取代码..."
+    TMP_APP_DIR="${APP_DIR}.tmp.$(date +%s)"
+    rm -rf "${TMP_APP_DIR}"
+    git clone "${REPO_URL}" "${TMP_APP_DIR}"
+    rm -rf "${APP_DIR}"
+    mv "${TMP_APP_DIR}" "${APP_DIR}"
+  fi
 fi
 
 echo "[4/7] 安装 Python 依赖..."
