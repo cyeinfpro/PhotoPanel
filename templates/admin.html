@@ -295,7 +295,7 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
       </div>
 
       <div>
-        <button class="btn primary" onclick="saveSettings()">保存设置</button>
+        <button class="btn primary" id="save-settings-btn" onclick="saveSettings()">保存设置</button>
       </div>
     </div>
   </section>
@@ -321,7 +321,7 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
         <input type="checkbox" id="scan_force" style="width:auto;min-height:auto;"> 强制全量重建（忽略目录 mtime）
       </label>
       <div style="text-align:right;">
-        <button class="btn warn" onclick="startScan()">启动扫描</button>
+        <button class="btn warn" id="start-scan-btn" onclick="startScan()">启动扫描</button>
       </div>
     </div>
 
@@ -461,6 +461,30 @@ const state = {
 
 function qs(id) { return document.getElementById(id); }
 
+function normalizeApiError(message) {
+  const msg = String(message || '').trim();
+  if (!msg) return '请求失败';
+  const idx = msg.indexOf(':');
+  const code = idx >= 0 ? msg.slice(0, idx).trim() : msg;
+  const detail = idx >= 0 ? msg.slice(idx + 1).trim() : '';
+  const map = {
+    photo_root_empty: '原图目录不能为空',
+    photo_root_must_be_absolute: '原图目录必须是绝对路径',
+    photo_root_not_found: '原图目录不存在',
+    photo_root_not_directory: '原图目录不是目录',
+    photo_root_not_readable: '原图目录不可读',
+    cache_root_empty: '缓存目录不能为空',
+    cache_root_must_be_absolute: '缓存目录必须是绝对路径',
+    cache_root_create_failed: '缓存目录创建失败（权限不足或路径无效）',
+    cache_root_not_directory: '缓存目录不是目录',
+    cache_root_not_writable: '缓存目录不可写',
+    cache_root_prepare_failed: '缓存目录初始化失败',
+    scan_running: '已有扫描任务在运行',
+  };
+  const readable = map[code] || code;
+  return detail ? `${readable}: ${detail}` : readable;
+}
+
 async function api(path, options = {}) {
   const res = await fetch(path, options);
   if (res.status === 401) {
@@ -472,6 +496,7 @@ async function api(path, options = {}) {
     try {
       const data = await res.json();
       msg = data.error || msg;
+      if (data.detail) msg = `${msg}: ${data.detail}`;
     } catch (_e) {}
     throw new Error(msg);
   }
@@ -497,33 +522,42 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
-  const payload = {
-    photo_root: qs('photo_root').value.trim(),
-    cache_root: qs('cache_root').value.trim(),
-    max_scan_albums_per_run: Number(qs('max_scan_albums_per_run').value),
-    max_scan_files_per_album: Number(qs('max_scan_files_per_album').value),
-    max_new_thumbs_per_run: Number(qs('max_new_thumbs_per_run').value),
-    workers: Number(qs('workers').value),
-    time_budget_seconds: Number(qs('time_budget_seconds').value),
-    preheat_count: Number(qs('preheat_count').value),
-    thumb_max_edge: Number(qs('thumb_max_edge').value),
-    preview_max_edge: Number(qs('preview_max_edge').value),
-    webp_method: Number(qs('webp_method').value),
-    thumb_quality: Number(qs('thumb_quality').value),
-    preview_quality: Number(qs('preview_quality').value),
-    thumb_target_kb: Number(qs('thumb_target_kb').value),
-    preview_target_kb: Number(qs('preview_target_kb').value),
-    allowed_extensions: qs('allowed_extensions').value.trim(),
-    exclude_dirs: qs('exclude_dirs').value.trim(),
-  };
+  const btn = qs('save-settings-btn');
+  if (btn) btn.disabled = true;
+  try {
+    const payload = {
+      photo_root: qs('photo_root').value.trim(),
+      cache_root: qs('cache_root').value.trim(),
+      max_scan_albums_per_run: Number(qs('max_scan_albums_per_run').value),
+      max_scan_files_per_album: Number(qs('max_scan_files_per_album').value),
+      max_new_thumbs_per_run: Number(qs('max_new_thumbs_per_run').value),
+      workers: Number(qs('workers').value),
+      time_budget_seconds: Number(qs('time_budget_seconds').value),
+      preheat_count: Number(qs('preheat_count').value),
+      thumb_max_edge: Number(qs('thumb_max_edge').value),
+      preview_max_edge: Number(qs('preview_max_edge').value),
+      webp_method: Number(qs('webp_method').value),
+      thumb_quality: Number(qs('thumb_quality').value),
+      preview_quality: Number(qs('preview_quality').value),
+      thumb_target_kb: Number(qs('thumb_target_kb').value),
+      preview_target_kb: Number(qs('preview_target_kb').value),
+      allowed_extensions: qs('allowed_extensions').value.trim(),
+      exclude_dirs: qs('exclude_dirs').value.trim(),
+    };
 
-  await api('/api/admin/settings', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+    await api('/api/admin/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
 
-  alert('设置已保存');
+    await loadSettings();
+    alert('设置已保存');
+  } catch (e) {
+    alert(`保存失败: ${normalizeApiError(e.message)}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function loadUsers() {
@@ -732,25 +766,34 @@ async function saveAcl() {
 }
 
 async function startScan() {
-  const years = qs('scan_years').value
-    .split(',')
-    .map(v => v.trim())
-    .filter(Boolean);
+  const btn = qs('start-scan-btn');
+  if (btn) btn.disabled = true;
+  try {
+    const years = qs('scan_years').value
+      .split(/[,\uFF0C]/)
+      .map(v => v.trim())
+      .filter(Boolean);
 
-  const album_paths = qs('scan_album_paths').value
-    .split('\n')
-    .map(v => v.trim())
-    .filter(Boolean);
+    const album_paths = qs('scan_album_paths').value
+      .split(/\r?\n/)
+      .map(v => v.trim().replaceAll('\\', '/').replace(/^\/+|\/+$/g, ''))
+      .filter(Boolean);
 
-  const force = qs('scan_force').checked;
+    const force = qs('scan_force').checked;
 
-  await api('/api/admin/albums/scan', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ years, album_paths, force }),
-  });
+    await api('/api/admin/albums/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ years, album_paths, force }),
+    });
 
-  await loadScanStatus();
+    await loadScanStatus();
+    alert('扫描任务已启动');
+  } catch (e) {
+    alert(`启动扫描失败: ${normalizeApiError(e.message)}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function clampPct(v) {

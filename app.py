@@ -383,6 +383,55 @@ def parse_bool(value):
     return False
 
 
+def normalize_years_filter(raw_years):
+    if isinstance(raw_years, str):
+        items = raw_years.replace("，", ",").split(",")
+    elif isinstance(raw_years, list):
+        items = raw_years
+    else:
+        return None
+
+    values = set()
+    for item in items:
+        year = str(item).strip()
+        if year:
+            values.add(year)
+    return values or None
+
+
+def normalize_album_rel_path(raw_path):
+    rel = str(raw_path or "").strip().replace("\\", "/")
+    if not rel:
+        return ""
+
+    parts = []
+    for part in rel.split("/"):
+        p = part.strip()
+        if not p or p == ".":
+            continue
+        if p == "..":
+            return ""
+        parts.append(p)
+
+    return "/".join(parts)
+
+
+def normalize_album_filter(raw_album_paths):
+    if isinstance(raw_album_paths, str):
+        items = raw_album_paths.splitlines()
+    elif isinstance(raw_album_paths, list):
+        items = raw_album_paths
+    else:
+        return None
+
+    values = set()
+    for item in items:
+        rel = normalize_album_rel_path(item)
+        if rel:
+            values.add(rel)
+    return values or None
+
+
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -901,7 +950,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
         deleted_files = 0
         generated_cache_pairs = 0
         completed_cache_tasks = 0
-        stop_reason = None
+        stop_reason = "no_album_matched" if not albums else None
 
         cache_tasks = []
         cache_budget = max_new_thumbs
@@ -1024,10 +1073,18 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
 
         set_setting("last_scan_summary", json.dumps(summary, ensure_ascii=False))
 
+        final_message = "completed"
+        if stop_reason in {"max_scan_albums_per_run", "time_budget_seconds"}:
+            final_message = "completed_with_limit"
+        elif stop_reason == "no_album_matched":
+            final_message = "completed_no_match"
+        elif stop_reason:
+            final_message = "completed_with_notice"
+
         set_scan_status(
             running=False,
             finished_at=int(time.time()),
-            message="completed" if not stop_reason else "completed_with_limit",
+            message=final_message,
             processed_albums=processed_albums,
             skipped_albums=skipped_albums,
             visited_albums=visited_albums,
@@ -1567,13 +1624,17 @@ def admin_scan_status():
 def admin_scan_albums():
     data = request.get_json(silent=True) or {}
 
-    years = data.get("years")
-    years_filter = set([str(y).strip() for y in years if str(y).strip()]) if isinstance(years, list) else None
+    years_filter = normalize_years_filter(data.get("years"))
+    album_filter = normalize_album_filter(data.get("album_paths"))
 
-    album_paths = data.get("album_paths")
-    album_filter = (
-        set([str(a).strip() for a in album_paths if str(a).strip()]) if isinstance(album_paths, list) else None
-    )
+    cfg = get_runtime_settings()
+    photo_root = Path(cfg["photo_root"]).expanduser()
+    if not photo_root.exists():
+        return jsonify({"error": "photo_root_not_found"}), 400
+    if not photo_root.is_dir():
+        return jsonify({"error": "photo_root_not_directory"}), 400
+    if not os.access(str(photo_root), os.R_OK | os.X_OK):
+        return jsonify({"error": "photo_root_not_readable"}), 400
 
     force = parse_bool(data.get("force", False))
 
@@ -1625,15 +1686,37 @@ def admin_settings():
 
     data = request.get_json(silent=True) or {}
 
-    path_keys = ["photo_root", "cache_root"]
-    for k in path_keys:
-        if k in data:
-            raw = str(data[k]).strip()
-            p = Path(raw).expanduser()
-            if not p.is_absolute():
-                return jsonify({"error": f"{k}_must_be_absolute"}), 400
+    if "photo_root" in data:
+        raw = str(data["photo_root"]).strip()
+        if not raw:
+            return jsonify({"error": "photo_root_empty"}), 400
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            return jsonify({"error": "photo_root_must_be_absolute"}), 400
+        if not p.exists():
+            return jsonify({"error": "photo_root_not_found"}), 400
+        if not p.is_dir():
+            return jsonify({"error": "photo_root_not_directory"}), 400
+        if not os.access(str(p), os.R_OK | os.X_OK):
+            return jsonify({"error": "photo_root_not_readable"}), 400
+        set_setting("photo_root", str(p))
+
+    if "cache_root" in data:
+        raw = str(data["cache_root"]).strip()
+        if not raw:
+            return jsonify({"error": "cache_root_empty"}), 400
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            return jsonify({"error": "cache_root_must_be_absolute"}), 400
+        try:
             ensure_dir(str(p))
-            set_setting(k, str(p))
+        except OSError as exc:
+            return jsonify({"error": "cache_root_create_failed", "detail": str(exc)}), 400
+        if not p.is_dir():
+            return jsonify({"error": "cache_root_not_directory"}), 400
+        if not os.access(str(p), os.W_OK | os.X_OK):
+            return jsonify({"error": "cache_root_not_writable"}), 400
+        set_setting("cache_root", str(p))
 
     int_fields = [
         ("max_scan_albums_per_run", 1, 50000),
@@ -1671,7 +1754,11 @@ def admin_settings():
         excludes = ",".join(parse_csv(data["exclude_dirs"]))
         set_setting("exclude_dirs", excludes)
 
-    ensure_runtime_dirs()
+    try:
+        ensure_runtime_dirs()
+    except OSError as exc:
+        return jsonify({"error": "cache_root_prepare_failed", "detail": str(exc)}), 400
+
     return jsonify({"ok": True})
 
 
