@@ -42,10 +42,17 @@
 - `TIME_BUDGET_SECONDS`
 - `PREHEAT_COUNT`（发布后预热数量）
 
+缓存压缩可配置：
+- `THUMB_MAX_EDGE` / `PREVIEW_MAX_EDGE`
+- `THUMB_QUALITY` / `PREVIEW_QUALITY`
+- `THUMB_TARGET_KB` / `PREVIEW_TARGET_KB`
+- `WEBP_METHOD`
+
 默认策略：
 - 目录 mtime 未变化时跳过该目录（增量）
 - 发布项目会预热前 N 张
 - 用户浏览时按需懒生成缓存
+- 管理后台可查看扫描/转码实时进度（进度条 + 明细）
 
 ## 4. API 概览
 
@@ -84,13 +91,14 @@ sudo ./install.sh
 ```
 
 安装脚本会：
-- 安装依赖（git/python3/venv/pillow 相关库）
+- 安装依赖（git/curl/python3/venv/pillow 相关库）
 - 创建运行用户 `photopanel`
 - 从 GitHub 拉取代码：`https://github.com/cyeinfpro/PhotoPanel`
-- 创建 venv 并安装 `requirements.txt`
-- 交互式输入默认管理员账号/密码
+- 创建 venv 并安装 `requirements.txt`（失败会自动回退到兼容依赖组合）
+- 仅交互输入默认管理员账号/密码（路径和端口使用默认值）
 - 生成 `/etc/photopanel.env`
 - 写入并启动 `systemd` 服务 `photopanel`
+- 自动健康检查 `http://127.0.0.1:$PORT/login`，失败会打印日志并退出
 - 输出服务访问端口（Nginx/反向代理由你自行配置）
 
 ## 6. 运行与维护

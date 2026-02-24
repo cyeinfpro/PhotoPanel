@@ -18,27 +18,19 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-prompt_default() {
-  local label="$1"
-  local default_val="$2"
-  local input
-  read -r -p "${label} [${default_val}]: " input
-  if [[ -z "${input}" ]]; then
-    echo "${default_val}"
-  else
-    echo "${input}"
-  fi
-}
-
 echo "==============================================="
 echo " PhotoNest 安装程序"
 echo "==============================================="
 
-PHOTO_ROOT="$(prompt_default '照片源目录 (PHOTO_ROOT)' "${DEFAULT_PHOTO_ROOT}")"
-CACHE_ROOT="$(prompt_default '缓存目录 (CACHE_ROOT)' "${DEFAULT_CACHE_ROOT}")"
-DATA_ROOT="$(prompt_default '数据目录 (DATA_ROOT)' "${DEFAULT_DATA_ROOT}")"
-PORT="$(prompt_default '服务端口 (PORT)' "${DEFAULT_PORT}")"
-ADMIN_USER="$(prompt_default '默认管理员账号' "${DEFAULT_ADMIN_USER}")"
+PHOTO_ROOT="${PHOTO_ROOT:-${DEFAULT_PHOTO_ROOT}}"
+CACHE_ROOT="${CACHE_ROOT:-${DEFAULT_CACHE_ROOT}}"
+DATA_ROOT="${DATA_ROOT:-${DEFAULT_DATA_ROOT}}"
+PORT="${PORT:-${DEFAULT_PORT}}"
+
+read -r -p "默认管理员账号 [${DEFAULT_ADMIN_USER}]: " ADMIN_USER
+if [[ -z "${ADMIN_USER}" ]]; then
+  ADMIN_USER="${DEFAULT_ADMIN_USER}"
+fi
 
 while true; do
   read -r -s -p "默认管理员密码 (至少6位): " ADMIN_PASSWORD
@@ -73,16 +65,10 @@ echo "- PORT:        ${PORT}"
 echo "- ADMIN_USER:  ${ADMIN_USER}"
 echo
 
-read -r -p "确认继续安装? [Y/n]: " CONFIRM
-if [[ -n "${CONFIRM}" && ! "${CONFIRM}" =~ ^[Yy]$ ]]; then
-  echo "已取消"
-  exit 0
-fi
-
 echo "[1/7] 安装系统依赖..."
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  git python3 python3-venv python3-pip \
+  git curl python3 python3-venv python3-pip python3-setuptools \
   libjpeg-dev libwebp-dev libheif-dev
 
 echo "[2/7] 创建运行用户和目录..."
@@ -101,11 +87,53 @@ fi
 
 echo "[4/7] 安装 Python 依赖..."
 python3 -m venv "${APP_DIR}/.venv"
-"${APP_DIR}/.venv/bin/pip" install -U pip wheel
-if [[ -f "${APP_DIR}/requirements.txt" ]]; then
-  "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt"
+PY_BIN="${APP_DIR}/.venv/bin/python"
+PY_MINOR="$("${PY_BIN}" - <<'PY'
+import sys
+print(sys.version_info.minor)
+PY
+)"
+
+if (( PY_MINOR < 8 )); then
+  "${PY_BIN}" -m pip install -U "pip<24.1" "setuptools<69" wheel
 else
-  "${APP_DIR}/.venv/bin/pip" install flask pillow pillow-heif gunicorn
+  "${PY_BIN}" -m pip install -U pip setuptools wheel
+fi
+
+install_fallback_deps() {
+  local flask_spec
+  local werkzeug_spec
+
+  if (( PY_MINOR >= 10 )); then
+    flask_spec="Flask>=2.3,<3.0"
+    werkzeug_spec="Werkzeug>=2.3,<3.0"
+  else
+    flask_spec="Flask>=2.2,<2.3"
+    werkzeug_spec="Werkzeug>=2.2,<2.3"
+  fi
+
+  "${PY_BIN}" -m pip install \
+    "${flask_spec}" \
+    "${werkzeug_spec}" \
+    "Jinja2>=3.1,<4.0" \
+    "itsdangerous>=2.1,<3.0" \
+    "Pillow>=9.2,<11.0" \
+    "gunicorn>=20.1,<23.0"
+
+  if (( PY_MINOR >= 8 )); then
+    if ! "${PY_BIN}" -m pip install "pillow-heif>=0.10.0"; then
+      echo "警告: pillow-heif 安装失败，将以无 HEIC 解码模式运行。"
+    fi
+  fi
+}
+
+if [[ -f "${APP_DIR}/requirements.txt" ]]; then
+  if ! "${PY_BIN}" -m pip install -r "${APP_DIR}/requirements.txt"; then
+    echo "requirements.txt 安装失败，回退到兼容依赖组合..."
+    install_fallback_deps
+  fi
+else
+  install_fallback_deps
 fi
 
 echo "[5/7] 写入环境文件 ${ENV_FILE} ..."
@@ -137,7 +165,7 @@ Group=photopanel
 WorkingDirectory=/opt/PhotoPanel
 EnvironmentFile=/etc/photopanel.env
 ExecStart=/opt/PhotoPanel/.venv/bin/gunicorn \
-  --bind 127.0.0.1:${PORT} \
+  --bind 0.0.0.0:${PORT} \
   --workers 4 \
   --threads 4 \
   --timeout 120 \
@@ -152,10 +180,26 @@ EOF
 systemctl daemon-reload
 systemctl enable --now photopanel
 
+echo "等待服务启动..."
+SERVICE_OK=0
+for _ in $(seq 1 20); do
+  if curl -fsS "http://127.0.0.1:${PORT}/login" > /dev/null 2>&1; then
+    SERVICE_OK=1
+    break
+  fi
+  sleep 1
+done
+
+if [[ "${SERVICE_OK}" -ne 1 ]]; then
+  echo "服务启动失败，输出最近日志："
+  journalctl -u photopanel -n 120 --no-pager || true
+  exit 1
+fi
+
 echo "[7/7] 完成"
 echo
 echo "访问地址: http://$(hostname -I | awk '{print $1}'):${PORT}"
 echo "默认管理员: ${ADMIN_USER}"
 echo "提示: Nginx/反向代理请由你后续自行配置。"
-echo "提示: 管理员首次登录后可在后台继续修改用户与扫描参数。"
+echo "提示: 管理员首次登录后可在后台继续设置照片目录和扫描参数。"
 echo "服务状态: systemctl status photopanel"

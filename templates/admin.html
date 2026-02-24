@@ -167,6 +167,13 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
 }
 .checkbox-list input { width: auto; min-height: auto; }
 .status-line { font-size: 12px; color: var(--muted); line-height: 1.6; white-space: pre-wrap; }
+.progress-stack { margin-top: 8px; display: grid; gap: 10px; }
+.progress-item { background: rgba(255,255,255,.84); border: 1px solid var(--line); border-radius: 12px; padding: 10px; }
+.progress-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--muted); margin-bottom: 7px; }
+.progress-title { font-weight: 600; color: var(--text); }
+.progress-track { width: 100%; height: 8px; border-radius: 999px; background: rgba(15,23,42,.08); overflow: hidden; }
+.progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #0a84ff, #3ea4ff); transition: width .35s ease; }
+#transcode-progress-fill { background: linear-gradient(90deg, #10b981, #44d6a3); }
 #settings-card { grid-column: span 5; }
 #scan-card { grid-column: span 7; }
 #users-card { grid-column: span 6; }
@@ -237,6 +244,45 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
         </div>
       </div>
 
+      <div class="row3">
+        <div>
+          <label>THUMB_MAX_EDGE (px)</label>
+          <input id="thumb_max_edge" type="number" min="240" max="1024">
+        </div>
+        <div>
+          <label>PREVIEW_MAX_EDGE (px)</label>
+          <input id="preview_max_edge" type="number" min="960" max="3840">
+        </div>
+        <div>
+          <label>WEBP_METHOD (0-6)</label>
+          <input id="webp_method" type="number" min="0" max="6">
+        </div>
+      </div>
+
+      <div class="row3">
+        <div>
+          <label>THUMB_QUALITY (50-92)</label>
+          <input id="thumb_quality" type="number" min="50" max="92">
+        </div>
+        <div>
+          <label>PREVIEW_QUALITY (55-95)</label>
+          <input id="preview_quality" type="number" min="55" max="95">
+        </div>
+        <div>
+          <label>THUMB_TARGET_KB</label>
+          <input id="thumb_target_kb" type="number" min="40" max="600">
+        </div>
+      </div>
+
+      <div class="row3">
+        <div>
+          <label>PREVIEW_TARGET_KB</label>
+          <input id="preview_target_kb" type="number" min="200" max="6000">
+        </div>
+        <div></div>
+        <div></div>
+      </div>
+
       <div class="row">
         <div>
           <label>允许扩展名 (逗号分隔)</label>
@@ -276,6 +322,27 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
       </label>
       <div style="text-align:right;">
         <button class="btn warn" onclick="startScan()">启动扫描</button>
+      </div>
+    </div>
+
+    <div class="progress-stack">
+      <div class="progress-item">
+        <div class="progress-head">
+          <span class="progress-title">扫描进度</span>
+          <span id="scan-progress-text">0 / 0 · 0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="scan-progress-fill"></div>
+        </div>
+      </div>
+      <div class="progress-item">
+        <div class="progress-head">
+          <span class="progress-title">转码进度 (thumb + preview)</span>
+          <span id="transcode-progress-text">0 / 0 · 0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="transcode-progress-fill"></div>
+        </div>
       </div>
     </div>
 
@@ -422,6 +489,8 @@ async function loadSettings() {
   const keys = [
     'photo_root', 'cache_root', 'max_scan_albums_per_run', 'max_scan_files_per_album',
     'max_new_thumbs_per_run', 'workers', 'time_budget_seconds', 'preheat_count',
+    'thumb_max_edge', 'preview_max_edge', 'webp_method',
+    'thumb_quality', 'preview_quality', 'thumb_target_kb', 'preview_target_kb',
     'allowed_extensions', 'exclude_dirs'
   ];
   keys.forEach((k) => { if (qs(k)) qs(k).value = s[k] ?? ''; });
@@ -437,6 +506,13 @@ async function saveSettings() {
     workers: Number(qs('workers').value),
     time_budget_seconds: Number(qs('time_budget_seconds').value),
     preheat_count: Number(qs('preheat_count').value),
+    thumb_max_edge: Number(qs('thumb_max_edge').value),
+    preview_max_edge: Number(qs('preview_max_edge').value),
+    webp_method: Number(qs('webp_method').value),
+    thumb_quality: Number(qs('thumb_quality').value),
+    preview_quality: Number(qs('preview_quality').value),
+    thumb_target_kb: Number(qs('thumb_target_kb').value),
+    preview_target_kb: Number(qs('preview_target_kb').value),
     allowed_extensions: qs('allowed_extensions').value.trim(),
     exclude_dirs: qs('exclude_dirs').value.trim(),
   };
@@ -677,15 +753,42 @@ async function startScan() {
   await loadScanStatus();
 }
 
+function clampPct(v) {
+  const n = Number(v) || 0;
+  if (n < 0) return 0;
+  if (n > 100) return 100;
+  return Math.round(n);
+}
+
+function setProgress(fillId, textId, done, total, pct) {
+  const safeDone = Number(done) || 0;
+  const safeTotal = Number(total) || 0;
+  const safePct = clampPct(pct);
+  qs(fillId).style.width = `${safePct}%`;
+  qs(textId).textContent = `${safeDone} / ${safeTotal} · ${safePct}%`;
+}
+
 async function loadScanStatus() {
   const s = await api('/api/admin/scan-status');
+
+  const scanTotal = s.scan_target_albums || s.found_albums || 0;
+  const scanDone = s.scan_done_albums || ((s.processed_albums || 0) + (s.skipped_albums || 0));
+  const scanPct = s.scan_progress_pct || 0;
+  setProgress('scan-progress-fill', 'scan-progress-text', scanDone, scanTotal, scanPct);
+
+  const transTotal = s.total_cache_tasks || 0;
+  const transDone = s.transcode_done_tasks || s.completed_cache_tasks || 0;
+  const transPct = s.transcode_progress_pct || 0;
+  setProgress('transcode-progress-fill', 'transcode-progress-text', transDone, transTotal, transPct);
+
   const lines = [];
   lines.push(`状态: ${s.message || 'unknown'}${s.running ? ' (running)' : ''}`);
   lines.push(`开始: ${s.started_at ? new Date(s.started_at * 1000).toLocaleString() : '-'}`);
   lines.push(`结束: ${s.finished_at ? new Date(s.finished_at * 1000).toLocaleString() : '-'}`);
+  lines.push(`项目进度: ${scanDone}/${scanTotal} (${scanPct}%)`);
   lines.push(`处理项目: ${s.processed_albums || 0}，跳过项目: ${s.skipped_albums || 0}`);
   lines.push(`扫描文件: ${s.scanned_files || 0}，更新文件: ${s.updated_files || 0}，删除文件: ${s.deleted_files || 0}`);
-  lines.push(`生成缓存对: ${s.generated_cache_pairs || 0}`);
+  lines.push(`转码进度: ${transDone}/${transTotal} (${transPct}%)，实际生成缓存对: ${s.generated_cache_pairs || 0}`);
   if (s.stop_reason) lines.push(`停止原因: ${s.stop_reason}`);
   if (s.last_scan_summary && Object.keys(s.last_scan_summary).length) {
     lines.push('最近任务摘要:');

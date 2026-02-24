@@ -30,8 +30,12 @@ from flask import (
     url_for,
 )
 from PIL import Image, ImageOps
-import pillow_heif
 from werkzeug.security import check_password_hash, generate_password_hash
+
+try:
+    import pillow_heif
+except Exception:
+    pillow_heif = None
 
 # ---------------------------------------------------------------------------
 # Config
@@ -48,9 +52,13 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 
 CACHE_EXT = ".webp"
-THUMB_MAX_EDGE = 512
-PREVIEW_MAX_EDGE = 2048
-CACHE_QUALITY = 82
+THUMB_MAX_EDGE_DEFAULT = int(os.environ.get("THUMB_MAX_EDGE", "480"))
+PREVIEW_MAX_EDGE_DEFAULT = int(os.environ.get("PREVIEW_MAX_EDGE", "1920"))
+THUMB_QUALITY_DEFAULT = int(os.environ.get("THUMB_QUALITY", "74"))
+PREVIEW_QUALITY_DEFAULT = int(os.environ.get("PREVIEW_QUALITY", "80"))
+THUMB_TARGET_KB_DEFAULT = int(os.environ.get("THUMB_TARGET_KB", "180"))
+PREVIEW_TARGET_KB_DEFAULT = int(os.environ.get("PREVIEW_TARGET_KB", "950"))
+WEBP_METHOD_DEFAULT = int(os.environ.get("WEBP_METHOD", "4"))
 
 ENABLE_X_ACCEL = os.environ.get("ENABLE_X_ACCEL", "0") == "1"
 ACCEL_CACHE_PREFIX = os.environ.get("ACCEL_CACHE_PREFIX", "/_cache")
@@ -65,6 +73,13 @@ DEFAULT_SETTINGS = {
     "workers": "4",
     "time_budget_seconds": "900",
     "preheat_count": "200",
+    "thumb_max_edge": str(THUMB_MAX_EDGE_DEFAULT),
+    "preview_max_edge": str(PREVIEW_MAX_EDGE_DEFAULT),
+    "thumb_quality": str(THUMB_QUALITY_DEFAULT),
+    "preview_quality": str(PREVIEW_QUALITY_DEFAULT),
+    "thumb_target_kb": str(THUMB_TARGET_KB_DEFAULT),
+    "preview_target_kb": str(PREVIEW_TARGET_KB_DEFAULT),
+    "webp_method": str(WEBP_METHOD_DEFAULT),
     "allowed_extensions": ".jpg,.jpeg,.png,.webp,.heic,.heif",
     "exclude_dirs": "@eaDir,.git,.cache,.thumbnails",
 }
@@ -79,7 +94,14 @@ logger = logging.getLogger("photopanel")
 if SECRET_KEY == "photopanel-change-me":
     logger.warning("SECRET_KEY is default. Set SECRET_KEY in production.")
 
-pillow_heif.register_heif_opener()
+if pillow_heif is not None:
+    try:
+        pillow_heif.register_heif_opener()
+        logger.info("HEIF/HEIC support enabled via pillow-heif.")
+    except Exception as exc:
+        logger.warning("pillow-heif exists but failed to register: %s", exc)
+else:
+    logger.warning("pillow-heif not installed. HEIC/HEIF decode may be unavailable.")
 
 # ---------------------------------------------------------------------------
 # App / global state
@@ -103,6 +125,10 @@ scan_status = {
     "updated_files": 0,
     "deleted_files": 0,
     "generated_cache_pairs": 0,
+    "found_albums": 0,
+    "scan_target_albums": 0,
+    "total_cache_tasks": 0,
+    "completed_cache_tasks": 0,
     "stop_reason": None,
     "summary": {},
 }
@@ -272,7 +298,26 @@ def parse_exts(value):
         if not normalized.startswith("."):
             normalized = f".{normalized}"
         exts.add(normalized)
+
+    if pillow_heif is None:
+        exts.discard(".heic")
+        exts.discard(".heif")
+
     return exts
+
+
+def get_cache_encode_settings(settings):
+    return {
+        "thumb_max_edge": get_int_setting(settings, "thumb_max_edge", THUMB_MAX_EDGE_DEFAULT, 240, 1024),
+        "preview_max_edge": get_int_setting(settings, "preview_max_edge", PREVIEW_MAX_EDGE_DEFAULT, 960, 3840),
+        "thumb_quality": get_int_setting(settings, "thumb_quality", THUMB_QUALITY_DEFAULT, 50, 92),
+        "preview_quality": get_int_setting(settings, "preview_quality", PREVIEW_QUALITY_DEFAULT, 55, 95),
+        "thumb_target_kb": get_int_setting(settings, "thumb_target_kb", THUMB_TARGET_KB_DEFAULT, 40, 600),
+        "preview_target_kb": get_int_setting(
+            settings, "preview_target_kb", PREVIEW_TARGET_KB_DEFAULT, 200, 6000
+        ),
+        "webp_method": get_int_setting(settings, "webp_method", WEBP_METHOD_DEFAULT, 0, 6),
+    }
 
 
 def ensure_runtime_dirs(settings=None):
@@ -390,8 +435,39 @@ def cover_file_path(cache_root, album_rel_path):
     return Path(cache_root) / "cover" / f"{album_rel_path}{CACHE_EXT}"
 
 
-def convert_image_to_webp(source_path, target_path, max_edge, quality=CACHE_QUALITY):
-    ensure_dir(str(target_path.parent))
+def encode_webp_with_budget(image, target_path, quality, min_quality, target_kb, method):
+    target_bytes = max(0, int(target_kb) * 1024)
+    tmp_path = Path(str(target_path) + ".tmp")
+    current_quality = max(min_quality, quality)
+    encoded_size = 0
+
+    try:
+        while True:
+            image.save(tmp_path, "WEBP", quality=current_quality, method=method)
+            encoded_size = tmp_path.stat().st_size
+
+            if target_bytes <= 0 or encoded_size <= target_bytes or current_quality <= min_quality:
+                break
+
+            next_quality = max(min_quality, current_quality - 6)
+            if next_quality == current_quality:
+                break
+            current_quality = next_quality
+
+        os.replace(tmp_path, target_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    return encoded_size, current_quality
+
+
+def convert_image_to_webp(source_path, target_path, max_edge, quality, min_quality, target_kb, method):
+    target = Path(target_path)
+    ensure_dir(str(target.parent))
     with Image.open(source_path) as img:
         img = ImageOps.exif_transpose(img)
         if img.mode in ("RGBA", "P", "LA"):
@@ -403,11 +479,12 @@ def convert_image_to_webp(source_path, target_path, max_edge, quality=CACHE_QUAL
             img = img.convert("RGB")
 
         img.thumbnail((max_edge, max_edge), Image.LANCZOS)
-        img.save(target_path, "WEBP", quality=quality, method=6)
+        encode_webp_with_budget(img, target, quality, min_quality, target_kb, method)
 
 
 def ensure_cached_variant(rel_path, src_mtime, variant):
     settings = get_runtime_settings()
+    encode_cfg = get_cache_encode_settings(settings)
     src = safe_join(settings["photo_root"], rel_path)
     cache_path = cache_file_path(settings["cache_root"], variant, rel_path)
 
@@ -422,8 +499,26 @@ def ensure_cached_variant(rel_path, src_mtime, variant):
         except OSError:
             pass
 
-    max_edge = THUMB_MAX_EDGE if variant == "thumb" else PREVIEW_MAX_EDGE
-    convert_image_to_webp(str(src), cache_path, max_edge)
+    if variant == "thumb":
+        max_edge = encode_cfg["thumb_max_edge"]
+        quality = encode_cfg["thumb_quality"]
+        min_quality = max(45, quality - 18)
+        target_kb = encode_cfg["thumb_target_kb"]
+    else:
+        max_edge = encode_cfg["preview_max_edge"]
+        quality = encode_cfg["preview_quality"]
+        min_quality = max(50, quality - 16)
+        target_kb = encode_cfg["preview_target_kb"]
+
+    convert_image_to_webp(
+        str(src),
+        cache_path,
+        max_edge=max_edge,
+        quality=quality,
+        min_quality=min_quality,
+        target_kb=target_kb,
+        method=encode_cfg["webp_method"],
+    )
     try:
         os.utime(cache_path, (src_mtime, src_mtime))
     except OSError:
@@ -733,6 +828,10 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
         updated_files=0,
         deleted_files=0,
         generated_cache_pairs=0,
+        found_albums=0,
+        scan_target_albums=0,
+        total_cache_tasks=0,
+        completed_cache_tasks=0,
         stop_reason=None,
         summary={},
     )
@@ -758,6 +857,8 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
             album_filter=album_filter,
             exclude_dirs=exclude_dirs,
         )
+        scan_target_albums = min(len(albums), max_scan_albums)
+        set_scan_status(found_albums=len(albums), scan_target_albums=scan_target_albums)
 
         processed_albums = 0
         skipped_albums = 0
@@ -765,6 +866,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
         updated_files = 0
         deleted_files = 0
         generated_cache_pairs = 0
+        completed_cache_tasks = 0
         stop_reason = None
 
         cache_tasks = []
@@ -829,6 +931,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
                 )
 
             # preheat changed/new published photos
+            set_scan_status(total_cache_tasks=len(cache_tasks), completed_cache_tasks=0)
             if cache_tasks and time.time() - start < time_budget:
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     futures = [pool.submit(preheat_worker, t) for t in cache_tasks]
@@ -837,14 +940,18 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
                             stop_reason = stop_reason or "time_budget_seconds"
                             break
                         photo_id, src_mtime, generated = fut.result()
+                        completed_cache_tasks += 1
                         if generated:
                             generated_cache_pairs += 1
                         # whether generated or not, cache is now expected to be valid
                         update_photo_cache_marker(photo_id, src_mtime, "thumb", conn=conn)
                         update_photo_cache_marker(photo_id, src_mtime, "preview", conn=conn)
 
-                        if generated_cache_pairs % 50 == 0:
-                            set_scan_status(generated_cache_pairs=generated_cache_pairs)
+                        if completed_cache_tasks % 10 == 0 or completed_cache_tasks == len(cache_tasks):
+                            set_scan_status(
+                                generated_cache_pairs=generated_cache_pairs,
+                                completed_cache_tasks=completed_cache_tasks,
+                            )
 
                 conn.commit()
 
@@ -859,6 +966,9 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
                 "updated_files": updated_files,
                 "deleted_files": deleted_files,
                 "generated_cache_pairs": generated_cache_pairs,
+                "scan_target_albums": scan_target_albums,
+                "total_cache_tasks": len(cache_tasks),
+                "completed_cache_tasks": completed_cache_tasks,
                 "stop_reason": stop_reason,
             }
         )
@@ -875,6 +985,10 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
             updated_files=updated_files,
             deleted_files=deleted_files,
             generated_cache_pairs=generated_cache_pairs,
+            found_albums=len(albums),
+            scan_target_albums=scan_target_albums,
+            total_cache_tasks=len(cache_tasks),
+            completed_cache_tasks=completed_cache_tasks,
             stop_reason=stop_reason,
             summary=summary,
         )
@@ -913,6 +1027,7 @@ def start_scan(trigger="manual", years_filter=None, album_filter=None, force=Fal
 
 def ensure_album_cover(album_row):
     settings = get_runtime_settings()
+    encode_cfg = get_cache_encode_settings(settings)
     cache_root = settings["cache_root"]
     cover_path = cover_file_path(cache_root, album_row["rel_path"])
 
@@ -953,7 +1068,8 @@ def ensure_album_cover(album_row):
             tile = ImageOps.fit(img.convert("RGB"), (cell, cell), Image.LANCZOS)
             canvas.paste(tile, coords[idx])
 
-    canvas.save(cover_path, "WEBP", quality=CACHE_QUALITY, method=6)
+    cover_quality = max(68, encode_cfg["thumb_quality"])
+    canvas.save(cover_path, "WEBP", quality=cover_quality, method=encode_cfg["webp_method"])
     try:
         os.utime(cover_path, (newest_mtime, newest_mtime))
     except OSError:
@@ -1374,6 +1490,23 @@ def admin_scan_status():
     else:
         status["last_scan_summary"] = {}
 
+    scan_total = int(status.get("scan_target_albums") or 0)
+    scan_done = int(status.get("processed_albums") or 0) + int(status.get("skipped_albums") or 0)
+    scan_progress_pct = 0
+    if scan_total > 0:
+        scan_progress_pct = min(100, int((scan_done / scan_total) * 100))
+
+    trans_total = int(status.get("total_cache_tasks") or 0)
+    trans_done = int(status.get("completed_cache_tasks") or 0)
+    transcode_progress_pct = 0
+    if trans_total > 0:
+        transcode_progress_pct = min(100, int((trans_done / trans_total) * 100))
+
+    status["scan_done_albums"] = scan_done
+    status["scan_progress_pct"] = scan_progress_pct
+    status["transcode_done_tasks"] = trans_done
+    status["transcode_progress_pct"] = transcode_progress_pct
+
     return jsonify(status)
 
 
@@ -1421,6 +1554,17 @@ def admin_settings():
                 "workers": get_int_setting(cfg, "workers", 4, 1, 16),
                 "time_budget_seconds": get_int_setting(cfg, "time_budget_seconds", 900, 10, 86400),
                 "preheat_count": get_int_setting(cfg, "preheat_count", 200, 0, 10000),
+                "thumb_max_edge": get_int_setting(cfg, "thumb_max_edge", THUMB_MAX_EDGE_DEFAULT, 240, 1024),
+                "preview_max_edge": get_int_setting(
+                    cfg, "preview_max_edge", PREVIEW_MAX_EDGE_DEFAULT, 960, 3840
+                ),
+                "thumb_quality": get_int_setting(cfg, "thumb_quality", THUMB_QUALITY_DEFAULT, 50, 92),
+                "preview_quality": get_int_setting(cfg, "preview_quality", PREVIEW_QUALITY_DEFAULT, 55, 95),
+                "thumb_target_kb": get_int_setting(cfg, "thumb_target_kb", THUMB_TARGET_KB_DEFAULT, 40, 600),
+                "preview_target_kb": get_int_setting(
+                    cfg, "preview_target_kb", PREVIEW_TARGET_KB_DEFAULT, 200, 6000
+                ),
+                "webp_method": get_int_setting(cfg, "webp_method", WEBP_METHOD_DEFAULT, 0, 6),
                 "allowed_extensions": cfg["allowed_extensions"],
                 "exclude_dirs": cfg["exclude_dirs"],
                 "last_scan_summary": last_scan_summary,
@@ -1446,6 +1590,13 @@ def admin_settings():
         ("workers", 1, 16),
         ("time_budget_seconds", 10, 86400),
         ("preheat_count", 0, 10000),
+        ("thumb_max_edge", 240, 1024),
+        ("preview_max_edge", 960, 3840),
+        ("thumb_quality", 50, 92),
+        ("preview_quality", 55, 95),
+        ("thumb_target_kb", 40, 600),
+        ("preview_target_kb", 200, 6000),
+        ("webp_method", 0, 6),
     ]
 
     for key, min_v, max_v in int_fields:

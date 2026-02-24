@@ -485,6 +485,7 @@ body {
       <span class="badge"><span class="status-dot"></span><span id="user-info"></span></span>
       <button id="admin-btn" class="btn" style="display:none;" onclick="goAdmin()">管理后台</button>
       <button id="refresh-btn" class="btn" style="display:none;" onclick="triggerScan()">增量扫描</button>
+      <span class="badge" id="scan-live" style="display:none;">扫描空闲</span>
       <button id="logout-btn" class="btn" onclick="logout()">退出</button>
     </div>
   </header>
@@ -537,7 +538,7 @@ const state = {
   albums: [],
   photos: [],
   page: 1,
-  pageSize: 200,
+  pageSize: 120,
   hasMore: false,
   loading: false,
   query: '',
@@ -577,6 +578,29 @@ function updateHeader() {
   if (CURRENT_USER.role === 'admin') {
     qs('admin-btn').style.display = 'inline-flex';
     qs('refresh-btn').style.display = 'inline-flex';
+    qs('scan-live').style.display = 'inline-flex';
+  }
+}
+
+async function updateScanLive() {
+  if (CURRENT_USER.role !== 'admin') return;
+  try {
+    const s = await api('/api/admin/scan-status');
+    const scanTotal = s.scan_target_albums || s.found_albums || 0;
+    const scanDone = s.scan_done_albums || ((s.processed_albums || 0) + (s.skipped_albums || 0));
+    const scanPct = s.scan_progress_pct || 0;
+
+    const transTotal = s.total_cache_tasks || 0;
+    const transDone = s.transcode_done_tasks || s.completed_cache_tasks || 0;
+    const transPct = s.transcode_progress_pct || 0;
+
+    if (s.running) {
+      qs('scan-live').textContent = `扫描 ${scanDone}/${scanTotal} (${scanPct}%) · 转码 ${transDone}/${transTotal} (${transPct}%)`;
+    } else {
+      qs('scan-live').textContent = '扫描空闲';
+    }
+  } catch (_e) {
+    qs('scan-live').textContent = '进度获取失败';
   }
 }
 
@@ -649,7 +673,7 @@ async function openYears() {
     html += `
       <article class="card" onclick="openYear(${JSON.stringify(y.year)})">
         <div class="cover">
-          ${cover ? `<img loading="lazy" src="${cover}" alt="${escapeHtml(y.year)}">` : placeholder('无封面')}
+          ${cover ? `<img loading="lazy" decoding="async" src="${cover}" alt="${escapeHtml(y.year)}">` : placeholder('无封面')}
         </div>
         <div class="card-body">
           <div class="name">${escapeHtml(y.year)}</div>
@@ -695,7 +719,7 @@ async function openYear(year) {
     html += `
       <article class="card" onclick="openAlbum(${a.id}, ${JSON.stringify(a.name)})">
         <div class="cover">
-          <img loading="lazy" src="${cover}" alt="${escapeHtml(a.name)}">
+          <img loading="lazy" decoding="async" src="${cover}" alt="${escapeHtml(a.name)}">
           ${publishTag}
         </div>
         <div class="card-body">
@@ -756,7 +780,7 @@ async function loadPhotoPage(reset = false) {
       tile.onclick = () => openLightboxById(p.id);
       tile.innerHTML = `
         <div class="photo-frame">
-          <img loading="lazy" src="/api/thumb/${p.id}" alt="${escapeHtml(p.filename)}">
+          <img loading="lazy" decoding="async" src="/api/thumb/${p.id}" alt="${escapeHtml(p.filename)}">
         </div>
         <div class="photo-meta">
           <div class="photo-filename">${escapeHtml(p.filename)}</div>
@@ -898,6 +922,10 @@ function bindEvents() {
   updateHeader();
   bindEvents();
   await loadStats();
+  if (CURRENT_USER.role === 'admin') {
+    await updateScanLive();
+    setInterval(() => { updateScanLive().catch(() => {}); }, 5000);
+  }
   await restoreFromHash();
 })();
 </script>
