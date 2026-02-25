@@ -142,6 +142,8 @@ DB_WRITE_RETRY_ATTEMPTS = int(os.environ.get("DB_WRITE_RETRY_ATTEMPTS", "8"))
 DB_WRITE_RETRY_SLEEP_SECONDS = float(os.environ.get("DB_WRITE_RETRY_SLEEP_SECONDS", "0.12"))
 PREHEAT_RETRY_ATTEMPTS = int(os.environ.get("PREHEAT_RETRY_ATTEMPTS", "2"))
 PREHEAT_RETRY_DELAY_SECONDS = float(os.environ.get("PREHEAT_RETRY_DELAY_SECONDS", "0.2"))
+CACHE_ENCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("CACHE_ENCODE_MAX_CONCURRENCY", "6")))
+CACHE_ENCODE_HIGH_RESERVED = max(0, int(os.environ.get("CACHE_ENCODE_HIGH_RESERVED", "1")))
 
 RUNTIME_SCAN_STATUS_KEY = "scan_status_json"
 RUNTIME_SCAN_LOCK_KEY = "scan_lock_json"
@@ -1093,6 +1095,38 @@ def is_valid_webp_cache_file(path_obj):
         return False
 
 
+class EncodePriorityLimiter:
+    def __init__(self, max_total, high_reserved):
+        self.max_total = max(1, int(max_total))
+        reserved = max(0, int(high_reserved))
+        self.high_reserved = min(reserved, self.max_total - 1 if self.max_total > 1 else 0)
+        self._in_use = 0
+        self._cv = threading.Condition()
+
+    def acquire(self, priority="normal"):
+        want_high = str(priority or "").strip().lower() == "high"
+        with self._cv:
+            while True:
+                normal_limit = self.max_total - self.high_reserved
+                allowed = self._in_use < self.max_total if want_high else self._in_use < normal_limit
+                if allowed:
+                    self._in_use += 1
+                    return
+                self._cv.wait()
+
+    def release(self):
+        with self._cv:
+            if self._in_use > 0:
+                self._in_use -= 1
+            self._cv.notify_all()
+
+
+ENCODE_PRIORITY_LIMITER = EncodePriorityLimiter(
+    CACHE_ENCODE_MAX_CONCURRENCY,
+    CACHE_ENCODE_HIGH_RESERVED,
+)
+
+
 def encode_webp_with_budget(image, target_path, quality, min_quality, target_kb, method):
     target_bytes = max(0, int(target_kb) * 1024)
     tmp_suffix = f".tmp.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
@@ -1141,7 +1175,7 @@ def convert_image_to_webp(source_path, target_path, max_edge, quality, min_quali
         encode_webp_with_budget(img, target, quality, min_quality, target_kb, method)
 
 
-def ensure_cached_variant(rel_path, src_mtime, variant, force=False):
+def ensure_cached_variant(rel_path, src_mtime, variant, force=False, priority="normal"):
     settings = get_runtime_settings()
     encode_cfg = get_cache_encode_settings(settings)
     src = safe_join(settings["photo_root"], rel_path)
@@ -1176,15 +1210,20 @@ def ensure_cached_variant(rel_path, src_mtime, variant, force=False):
         min_quality = max(50, quality - 16)
         target_kb = encode_cfg["preview_target_kb"]
 
-    convert_image_to_webp(
-        str(src),
-        cache_path,
-        max_edge=max_edge,
-        quality=quality,
-        min_quality=min_quality,
-        target_kb=target_kb,
-        method=encode_cfg["webp_method"],
-    )
+    encode_priority = "high" if str(priority or "").strip().lower() == "high" else "normal"
+    ENCODE_PRIORITY_LIMITER.acquire(encode_priority)
+    try:
+        convert_image_to_webp(
+            str(src),
+            cache_path,
+            max_edge=max_edge,
+            quality=quality,
+            min_quality=min_quality,
+            target_kb=target_kb,
+            method=encode_cfg["webp_method"],
+        )
+    finally:
+        ENCODE_PRIORITY_LIMITER.release()
     try:
         os.utime(cache_path, (src_mtime, src_mtime))
     except OSError:
@@ -3158,7 +3197,13 @@ def api_preview(photo_id):
     if not photo:
         abort(403)
 
-    local, generated = ensure_cached_variant(photo["rel_path"], photo["mtime"], "preview")
+    req_priority = "high" if (request.args.get("priority", "").strip().lower() == "high") else "normal"
+    local, generated = ensure_cached_variant(
+        photo["rel_path"],
+        photo["mtime"],
+        "preview",
+        priority=req_priority,
+    )
     if generated or photo["cached_preview_mtime"] < photo["mtime"]:
         update_photo_cache_marker(photo_id, photo["mtime"], "preview")
 

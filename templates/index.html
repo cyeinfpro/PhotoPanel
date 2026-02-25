@@ -330,8 +330,6 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  content-visibility: auto;
-  contain-intrinsic-size: 320px 300px;
 }
 
 .photo-tile:hover {
@@ -665,37 +663,299 @@ const state = {
   query: '',
   lightboxIndex: -1,
   lightboxRenderToken: '',
+  lightboxOpen: false,
+  tileVisibleQueue: [],
+  tilePrefetchQueue: [],
+  lightboxPrefetchQueue: [],
+  inflightTileTasks: new Map(),
+  suspendedByLightbox: new Set(),
+  lightboxPreviewCache: new Map(),
+  lightboxPreviewOrder: [],
+  lightboxMainController: null,
+  lightboxPrefetchController: null,
+  lightboxPrefetchInFlight: 0,
+  lightboxPlaceholderSrc: '',
 };
 
-const MAX_PARALLEL_IMAGE_REQUESTS = Math.max(
-  4,
-  Math.min(12, Math.floor((navigator.hardwareConcurrency || 8) * 0.75))
-);
-let activeImageRequests = 0;
-const pendingImageStarts = [];
+const NETWORK_PROFILE = (() => {
+  const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection || {};
+  const effectiveType = String(conn.effectiveType || '').toLowerCase();
+  const saveData = Boolean(conn.saveData);
+  if (saveData || effectiveType.includes('2g')) {
+    return { name: '2g', maxTileConcurrency: 4, prefetchMargin: 300 };
+  }
+  if (effectiveType === '3g') {
+    return { name: '3g', maxTileConcurrency: 6, prefetchMargin: 600 };
+  }
+  return { name: 'fast', maxTileConcurrency: 8, prefetchMargin: 1000 };
+})();
 
-function pumpImageStartQueue() {
-  while (activeImageRequests < MAX_PARALLEL_IMAGE_REQUESTS && pendingImageStarts.length) {
-    const start = pendingImageStarts.shift();
-    if (typeof start === 'function') start();
+const TILE_VISIBLE_ROOT_MARGIN = '180px 0px';
+const TILE_PREFETCH_ROOT_MARGIN = `${NETWORK_PROFILE.prefetchMargin}px 0px`;
+const TILE_VISIBLE_RESERVED_SLOTS = 2;
+const LIGHTBOX_TILE_BACKGROUND_LIMIT = 2;
+const TILE_RETRY_DELAY_MS = 300;
+const LIGHTBOX_PREFETCH_CACHE_LIMIT = 6;
+const LIGHTBOX_PREFETCH_CONCURRENCY = 1;
+const TILE_EAGER_COUNT = 24;
+
+const tileTaskByImg = new WeakMap();
+
+function tileConcurrencyLimit() {
+  return state.lightboxOpen ? LIGHTBOX_TILE_BACKGROUND_LIMIT : NETWORK_PROFILE.maxTileConcurrency;
+}
+
+function removeTaskFromQueue(queue, task) {
+  const idx = queue.indexOf(task);
+  if (idx >= 0) queue.splice(idx, 1);
+}
+
+function taskDistancePx(task) {
+  if (!task?.img) return Number.POSITIVE_INFINITY;
+  const rect = task.img.getBoundingClientRect();
+  const vh = window.innerHeight || document.documentElement.clientHeight || 1;
+  if (rect.bottom < 0) return Math.abs(rect.bottom);
+  if (rect.top > vh) return rect.top - vh;
+  return 0;
+}
+
+function isTaskVisible(task) {
+  if (!task?.img) return false;
+  const rect = task.img.getBoundingClientRect();
+  const vh = window.innerHeight || document.documentElement.clientHeight || 1;
+  return rect.bottom >= 0 && rect.top <= vh;
+}
+
+function enqueueTileTask(task, priority = 'prefetch', toFront = false) {
+  if (!task) return;
+  if (task.state === 'done' || task.state === 'failed') return;
+  task.distancePx = taskDistancePx(task);
+  if (task.state === 'loading') {
+    if (priority === 'visible') task.priority = 'visible';
+    return;
+  }
+  removeTaskFromQueue(state.tileVisibleQueue, task);
+  removeTaskFromQueue(state.tilePrefetchQueue, task);
+  task.priority = priority === 'visible' ? 'visible' : 'prefetch';
+  task.state = 'queued';
+  task.queuedAt = Date.now();
+  if (task.priority === 'visible') {
+    if (toFront) {
+      state.tileVisibleQueue.unshift(task);
+    } else {
+      state.tileVisibleQueue.push(task);
+    }
+    state.suspendedByLightbox.delete(task);
+  } else {
+    state.tilePrefetchQueue.push(task);
+  }
+  scheduleTileLoads();
+}
+
+function promoteTileTask(task) {
+  enqueueTileTask(task, 'visible', true);
+}
+
+function suspendTileTask(task) {
+  if (!task || task.state !== 'loading') return false;
+  if (task.priority === 'visible') return false;
+  const img = task.img;
+  const frame = task.frame;
+  task.runToken = '';
+  if (task.retryTimer) {
+    clearTimeout(task.retryTimer);
+    task.retryTimer = null;
+  }
+  img.onload = null;
+  img.onerror = null;
+  try {
+    img.src = '';
+  } catch (_e) {}
+  if (frame) frame.classList.remove('loading');
+  state.inflightTileTasks.delete(img);
+  task.state = 'idle';
+  task.retryCount = 0;
+  state.suspendedByLightbox.add(task);
+  return true;
+}
+
+function suspendLowPriorityTilesForLightbox() {
+  const limit = tileConcurrencyLimit();
+  if (state.inflightTileTasks.size <= limit) return;
+  const candidates = Array.from(state.inflightTileTasks.values())
+    .filter((task) => task.priority !== 'visible' && !isTaskVisible(task))
+    .sort((a, b) => taskDistancePx(b) - taskDistancePx(a));
+  while (state.inflightTileTasks.size > limit && candidates.length > 0) {
+    const task = candidates.shift();
+    if (!task) break;
+    suspendTileTask(task);
+  }
+  scheduleTileLoads();
+}
+
+function restoreSuspendedTiles() {
+  if (!state.suspendedByLightbox.size) return;
+  const tasks = Array.from(state.suspendedByLightbox);
+  state.suspendedByLightbox.clear();
+  for (const task of tasks) {
+    if (task?.state === 'idle') {
+      enqueueTileTask(task, task.priority === 'visible' ? 'visible' : 'prefetch');
+    }
+  }
+  scheduleTileLoads();
+}
+
+function scheduleTileLoads() {
+  const maxSlots = tileConcurrencyLimit();
+  while (state.inflightTileTasks.size < maxSlots && state.tileVisibleQueue.length > 0) {
+    const nextVisible = state.tileVisibleQueue.shift();
+    startTileTask(nextVisible);
+  }
+  if (state.lightboxOpen) return;
+  const visiblePending = state.tileVisibleQueue.length;
+  const prefetchBudget = visiblePending > 0
+    ? Math.max(0, maxSlots - Math.min(TILE_VISIBLE_RESERVED_SLOTS, maxSlots))
+    : maxSlots;
+  while (state.inflightTileTasks.size < prefetchBudget && state.tilePrefetchQueue.length > 0) {
+    const nextPrefetch = state.tilePrefetchQueue.shift();
+    startTileTask(nextPrefetch);
   }
 }
 
-function queueImageStart(start) {
-  pendingImageStarts.push(start);
-  pumpImageStartQueue();
+function startTileTask(task) {
+  if (!task || (task.state !== 'queued' && task.state !== 'idle')) return;
+  const img = task.img;
+  const frame = task.frame;
+  if (!img || !frame) return;
+
+  task.state = 'loading';
+  task.retryCount = task.retryCount || 0;
+  const token = `${task.photo?.id || 'p'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  task.runToken = token;
+  state.inflightTileTasks.set(img, task);
+  frame.classList.add('loading');
+  frame.classList.remove('failed');
+  img.fetchPriority = task.priority === 'visible' ? 'high' : 'low';
+  img.decoding = 'async';
+  const source = task.thumbSrc;
+
+  const finish = (ok) => {
+    if (task.runToken !== token) return;
+    if (task.retryTimer) {
+      clearTimeout(task.retryTimer);
+      task.retryTimer = null;
+    }
+    img.onload = null;
+    img.onerror = null;
+    state.inflightTileTasks.delete(img);
+    frame.classList.remove('loading');
+    if (ok) {
+      task.state = 'done';
+      img.dataset.loadedSrc = img.currentSrc || img.src || source || '';
+      frame.classList.remove('failed');
+    } else {
+      task.state = 'failed';
+      frame.classList.add('failed');
+    }
+    task.runToken = '';
+    scheduleTileLoads();
+  };
+
+  img.onload = () => finish(true);
+  img.onerror = () => {
+    if (task.runToken !== token) return;
+    if (task.retryCount < 1) {
+      task.retryCount += 1;
+      task.retryTimer = window.setTimeout(() => {
+        if (task.runToken !== token) return;
+        img.src = source;
+      }, TILE_RETRY_DELAY_MS);
+      return;
+    }
+    finish(false);
+  };
+  img.src = source;
 }
 
-const tileImageObserver = 'IntersectionObserver' in window
+const tileVisibleObserver = 'IntersectionObserver' in window
   ? new IntersectionObserver((entries) => {
     for (const entry of entries) {
-      if (!entry.isIntersecting) continue;
-      const img = entry.target;
-      tileImageObserver.unobserve(img);
-      queueImageStart(img.__tileStartLoad);
+      const task = tileTaskByImg.get(entry.target);
+      if (!task) continue;
+      if (entry.isIntersecting) {
+        promoteTileTask(task);
+      }
     }
-  }, { rootMargin: '600px 0px', threshold: 0.01 })
+  }, { rootMargin: TILE_VISIBLE_ROOT_MARGIN, threshold: 0.01 })
   : null;
+
+const tilePrefetchObserver = 'IntersectionObserver' in window
+  ? new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const task = tileTaskByImg.get(entry.target);
+      if (!task) continue;
+      if (entry.isIntersecting) {
+        if (task.state === 'idle' && task.priority !== 'visible') {
+          enqueueTileTask(task, 'prefetch');
+        }
+      } else if (!isTaskVisible(task) && task.priority !== 'visible' && task.state === 'queued') {
+        removeTaskFromQueue(state.tilePrefetchQueue, task);
+        task.state = 'idle';
+      }
+    }
+  }, { rootMargin: TILE_PREFETCH_ROOT_MARGIN, threshold: 0.01 })
+  : null;
+
+function observeTileTask(task) {
+  if (!task?.img) return;
+  if (tileVisibleObserver) tileVisibleObserver.observe(task.img);
+  if (tilePrefetchObserver) tilePrefetchObserver.observe(task.img);
+}
+
+function pruneQueuedTileTasks() {
+  const vh = window.innerHeight || document.documentElement.clientHeight || 1;
+  for (const task of [...state.tilePrefetchQueue]) {
+    if (!task?.img || task.state !== 'queued') continue;
+    const rect = task.img.getBoundingClientRect();
+    if (rect.bottom < -2 * vh) {
+      removeTaskFromQueue(state.tilePrefetchQueue, task);
+      task.state = 'idle';
+    } else {
+      task.distancePx = taskDistancePx(task);
+    }
+  }
+}
+
+let pruneTileTimer = 0;
+function schedulePruneQueuedTileTasks() {
+  if (pruneTileTimer) return;
+  pruneTileTimer = window.setTimeout(() => {
+    pruneTileTimer = 0;
+    pruneQueuedTileTasks();
+  }, 120);
+}
+
+function clearTileSchedulingContext() {
+  if (tileVisibleObserver || tilePrefetchObserver) {
+    document.querySelectorAll('#photo-grid img[data-photo-id]').forEach((img) => {
+      if (tileVisibleObserver) tileVisibleObserver.unobserve(img);
+      if (tilePrefetchObserver) tilePrefetchObserver.unobserve(img);
+      const task = tileTaskByImg.get(img);
+      if (!task) return;
+      task.runToken = '';
+      if (task.retryTimer) {
+        clearTimeout(task.retryTimer);
+        task.retryTimer = null;
+      }
+      img.onload = null;
+      img.onerror = null;
+    });
+  }
+  state.tileVisibleQueue = [];
+  state.tilePrefetchQueue = [];
+  state.inflightTileTasks.clear();
+  state.suspendedByLightbox.clear();
+}
 
 function qs(id) { return document.getElementById(id); }
 
@@ -847,8 +1107,13 @@ function withVersion(url, value) {
   return `${url}${joiner}v=${token}`;
 }
 
-function previewUrl(photo) {
-  return withVersion(`/api/preview/${photo.id}`, photo?.mtime);
+function previewUrl(photo, highPriority = false) {
+  let url = withVersion(`/api/preview/${photo.id}`, photo?.mtime);
+  if (highPriority) {
+    const joiner = url.includes('?') ? '&' : '?';
+    url = `${url}${joiner}priority=high`;
+  }
+  return url;
 }
 
 function thumbUrl(photo) {
@@ -866,59 +1131,129 @@ function fallbackOriginalUrl(photo) {
 function bindTileImage(img, photo, eager = false) {
   const frame = img?.closest('.photo-frame');
   if (!frame || !photo) return;
-  let attempt = 0;
-  let slotHeld = false;
-  const sources = [thumbUrl(photo), previewUrl(photo)];
-
-  const releaseSlot = () => {
-    if (!slotHeld) return;
-    slotHeld = false;
-    activeImageRequests = Math.max(0, activeImageRequests - 1);
-    pumpImageStartQueue();
+  const task = {
+    img,
+    frame,
+    photo,
+    thumbSrc: thumbUrl(photo),
+    state: 'idle',
+    priority: eager ? 'visible' : 'prefetch',
+    retryCount: 0,
+    retryTimer: null,
+    queuedAt: 0,
+    distancePx: 0,
+    runToken: '',
   };
+  tileTaskByImg.set(img, task);
+  img.dataset.photoId = String(photo.id);
+  img.dataset.thumbSrc = task.thumbSrc;
+  img.dataset.loadedSrc = '';
+  img.loading = 'eager';
+  img.decoding = 'async';
+  img.fetchPriority = eager ? 'high' : 'low';
 
-  const setSource = () => {
-    if (attempt >= sources.length) {
-      frame.classList.remove('loading');
-      frame.classList.add('failed');
-      releaseSlot();
-      return;
-    }
-    frame.classList.add('loading');
-    frame.classList.remove('failed');
-    img.src = sources[attempt];
-    attempt += 1;
-  };
-
-  img.onload = () => {
-    frame.classList.remove('loading');
-    frame.classList.remove('failed');
-    releaseSlot();
-  };
-  img.onerror = () => {
-    if (attempt < sources.length) {
-      setSource();
-      return;
-    }
-    frame.classList.remove('loading');
-    frame.classList.add('failed');
-    releaseSlot();
-  };
-
-  const startLoad = () => {
-    if (img.dataset.loadStarted === '1') return;
-    img.dataset.loadStarted = '1';
-    slotHeld = true;
-    activeImageRequests += 1;
-    setSource();
-  };
-
-  img.__tileStartLoad = startLoad;
-  if (eager || !tileImageObserver) {
-    queueImageStart(startLoad);
+  if (eager || !tileVisibleObserver || !tilePrefetchObserver) {
+    promoteTileTask(task);
   } else {
-    tileImageObserver.observe(img);
+    observeTileTask(task);
   }
+}
+
+function getCachedLightboxPreview(photoId) {
+  return state.lightboxPreviewCache.get(photoId) || '';
+}
+
+function putCachedLightboxPreview(photoId, objectUrl) {
+  if (!photoId || !objectUrl) return;
+  const existing = state.lightboxPreviewCache.get(photoId);
+  if (existing && existing !== objectUrl) {
+    try { URL.revokeObjectURL(existing); } catch (_e) {}
+  }
+  state.lightboxPreviewCache.set(photoId, objectUrl);
+  state.lightboxPreviewOrder = state.lightboxPreviewOrder.filter((id) => id !== photoId);
+  state.lightboxPreviewOrder.push(photoId);
+  while (state.lightboxPreviewOrder.length > LIGHTBOX_PREFETCH_CACHE_LIMIT) {
+    const evictId = state.lightboxPreviewOrder.shift();
+    if (!evictId) continue;
+    const evictUrl = state.lightboxPreviewCache.get(evictId);
+    if (evictUrl) {
+      try { URL.revokeObjectURL(evictUrl); } catch (_e) {}
+    }
+    state.lightboxPreviewCache.delete(evictId);
+  }
+}
+
+function revokeAllLightboxCachedPreviews() {
+  for (const url of state.lightboxPreviewCache.values()) {
+    try { URL.revokeObjectURL(url); } catch (_e) {}
+  }
+  state.lightboxPreviewCache.clear();
+  state.lightboxPreviewOrder = [];
+}
+
+function abortLightboxMainFetch() {
+  if (state.lightboxMainController) {
+    try { state.lightboxMainController.abort(); } catch (_e) {}
+    state.lightboxMainController = null;
+  }
+}
+
+function abortLightboxPrefetchFetch() {
+  if (state.lightboxPrefetchController) {
+    try { state.lightboxPrefetchController.abort(); } catch (_e) {}
+    state.lightboxPrefetchController = null;
+  }
+}
+
+function clearLightboxPrefetchQueue() {
+  state.lightboxPrefetchQueue = [];
+}
+
+function enqueueLightboxPrefetch(photo) {
+  if (!photo?.id || !state.lightboxOpen) return;
+  if (state.lightboxPreviewCache.has(photo.id)) return;
+  if (state.lightboxPrefetchQueue.some((p) => p?.id === photo.id)) return;
+  state.lightboxPrefetchQueue.push(photo);
+  runLightboxPrefetchQueue();
+}
+
+async function runLightboxPrefetchQueue() {
+  if (!state.lightboxOpen) return;
+  if (state.lightboxPrefetchInFlight >= LIGHTBOX_PREFETCH_CONCURRENCY) return;
+  const nextPhoto = state.lightboxPrefetchQueue.shift();
+  if (!nextPhoto?.id) return;
+  if (state.lightboxPreviewCache.has(nextPhoto.id)) {
+    runLightboxPrefetchQueue();
+    return;
+  }
+  state.lightboxPrefetchInFlight += 1;
+  const controller = new AbortController();
+  state.lightboxPrefetchController = controller;
+  try {
+    const res = await fetch(previewUrl(nextPhoto), { signal: controller.signal, cache: 'force-cache', priority: 'low' });
+    if (!res.ok) throw new Error(`http_${res.status}`);
+    const blob = await res.blob();
+    if (!state.lightboxOpen) return;
+    const objectUrl = URL.createObjectURL(blob);
+    putCachedLightboxPreview(nextPhoto.id, objectUrl);
+  } catch (_e) {
+    // best effort prefetch
+  } finally {
+    state.lightboxPrefetchInFlight = Math.max(0, state.lightboxPrefetchInFlight - 1);
+    if (state.lightboxPrefetchController === controller) {
+      state.lightboxPrefetchController = null;
+    }
+    if (state.lightboxOpen) runLightboxPrefetchQueue();
+  }
+}
+
+function queueLightboxNeighborPrefetch(centerIndex) {
+  const total = state.photos.length;
+  if (total <= 1) return;
+  const next = state.photos[(centerIndex + 1) % total];
+  const prev = state.photos[(centerIndex - 1 + total) % total];
+  enqueueLightboxPrefetch(next);
+  enqueueLightboxPrefetch(prev);
 }
 
 function openYearFromEl(el) {
@@ -945,6 +1280,7 @@ function openFolderFromEl(el) {
 }
 
 async function openYears() {
+  clearTileSchedulingContext();
   state.view = 'years';
   state.year = '';
   state.albumId = null;
@@ -984,6 +1320,7 @@ async function openYears() {
 }
 
 async function openYear(year) {
+  clearTileSchedulingContext();
   state.view = 'albums';
   state.year = year;
   state.albumId = null;
@@ -1076,6 +1413,7 @@ async function loadPhotoPage(reset = false) {
     const data = await api(`/api/photos?${q.toString()}`);
 
     if (reset) {
+      clearTileSchedulingContext();
       state.photos = [];
       qs('content').innerHTML = '<div class="folder-grid" id="folder-grid"></div><div class="photo-masonry" id="photo-grid"></div><div class="load-more" id="load-more"></div>';
     }
@@ -1127,10 +1465,9 @@ async function loadPhotoPage(reset = false) {
       const p = photoBatch[idx];
       const tile = document.createElement('article');
       tile.className = 'photo-tile';
-      tile.onclick = () => openLightboxById(p.id);
       tile.innerHTML = `
         <div class="photo-frame">
-          <img loading="lazy" decoding="async" alt="${escapeHtml(p.filename)}">
+          <img decoding="async" alt="${escapeHtml(p.filename)}">
         </div>
         <div class="photo-meta">
           <div class="photo-filename">${escapeHtml(p.filename)}</div>
@@ -1138,13 +1475,14 @@ async function loadPhotoPage(reset = false) {
         </div>
       `;
       const img = tile.querySelector('img');
-      const eager = reset && idx < 18;
-      img.loading = eager ? 'eager' : 'lazy';
+      tile.onclick = () => openLightboxById(p.id, img);
+      const eager = reset && idx < TILE_EAGER_COUNT;
       img.fetchPriority = eager ? 'high' : 'low';
       bindTileImage(img, p, eager);
       fragment.appendChild(tile);
     }
     grid.appendChild(fragment);
+    scheduleTileLoads();
 
     if (reset && Number(data.folder_count || 0) === 0 && Number(data.total || 0) === 0) {
       renderEmpty('当前目录为空');
@@ -1169,24 +1507,75 @@ function loadMorePhotos() {
   loadPhotoPage(false);
 }
 
-function openLightboxById(photoId) {
+function resolveLightboxPlaceholder(photo, sourceImg = null) {
+  const src = sourceImg?.dataset?.loadedSrc || sourceImg?.currentSrc || sourceImg?.src || '';
+  if (src) return src;
+  if (!photo?.id) return '';
+  const img = document.querySelector(`#photo-grid img[data-photo-id="${photo.id}"]`);
+  return img?.dataset?.loadedSrc || img?.currentSrc || img?.dataset?.thumbSrc || thumbUrl(photo);
+}
+
+function applyLightboxErrorFallback(img, stage, token, photo) {
+  if (state.lightboxRenderToken !== token) return;
+  if (img.dataset.fallbackTried === '1') {
+    setLightboxStage(stage, 'error', '图片加载失败，可点击“下载原图”');
+    return;
+  }
+  img.dataset.fallbackTried = '1';
+  setLightboxStage(stage, 'loading', '预览异常，切换原图...');
+  img.onload = () => {
+    if (state.lightboxRenderToken !== token) return;
+    setLightboxStage(stage, 'ready', '');
+  };
+  img.onerror = () => {
+    if (state.lightboxRenderToken !== token) return;
+    setLightboxStage(stage, 'error', '图片加载失败，可点击“下载原图”');
+  };
+  img.src = fallbackOriginalUrl(photo);
+}
+
+function bindLightboxImageHandlers(img, stage, token, photo) {
+  img.onload = () => {
+    if (state.lightboxRenderToken !== token) return;
+    setLightboxStage(stage, 'ready', '');
+    queueLightboxNeighborPrefetch(state.lightboxIndex);
+  };
+  img.onerror = () => {
+    applyLightboxErrorFallback(img, stage, token, photo);
+  };
+}
+
+function openLightboxById(photoId, sourceImg = null) {
   const idx = state.photos.findIndex(p => p.id === photoId);
   if (idx < 0) return;
   state.lightboxIndex = idx;
+  state.lightboxOpen = true;
+  state.lightboxPlaceholderSrc = resolveLightboxPlaceholder(state.photos[idx], sourceImg);
   qs('lightbox').classList.add('show');
   document.body.style.overflow = 'hidden';
+  suspendLowPriorityTilesForLightbox();
   renderLightbox();
 }
 
 function closeLightbox() {
+  state.lightboxOpen = false;
   qs('lightbox').classList.remove('show');
   state.lightboxRenderToken = '';
+  abortLightboxMainFetch();
+  abortLightboxPrefetchFetch();
+  clearLightboxPrefetchQueue();
+  state.lightboxPrefetchInFlight = 0;
+  state.lightboxPlaceholderSrc = '';
+  revokeAllLightboxCachedPreviews();
   document.body.style.overflow = '';
+  restoreSuspendedTiles();
+  scheduleTileLoads();
 }
 
 function stepLightbox(delta) {
   if (!state.photos.length) return;
   state.lightboxIndex = (state.lightboxIndex + delta + state.photos.length) % state.photos.length;
+  state.lightboxPlaceholderSrc = resolveLightboxPlaceholder(state.photos[state.lightboxIndex]);
   renderLightbox();
 }
 
@@ -1197,27 +1586,55 @@ function renderLightbox() {
   const stage = qs('lb-stage');
   const token = `${p.id}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   state.lightboxRenderToken = token;
+  abortLightboxMainFetch();
+  img.fetchPriority = 'high';
+  clearLightboxPrefetchQueue();
 
-  setLightboxStage(stage, 'loading', '加载预览中...');
+  setLightboxStage(stage, 'loading', '加载高清预览中...');
   img.dataset.token = token;
   img.dataset.fallbackTried = '0';
-  img.onerror = () => {
-    if (state.lightboxRenderToken !== token) return;
-    if (img.dataset.fallbackTried !== '1') {
-      img.dataset.fallbackTried = '1';
-      setLightboxStage(stage, 'loading', '预览异常，切换原图...');
-      img.src = fallbackOriginalUrl(p);
-      return;
-    }
-    setLightboxStage(stage, 'error', '图片加载失败，可点击“下载原图”');
-  };
-  img.onload = () => {
-    if (state.lightboxRenderToken !== token) return;
-    setLightboxStage(stage, 'ready', '');
-  };
-  img.src = previewUrl(p);
   qs('lb-title').textContent = p.filename;
   qs('lb-counter').textContent = `${state.lightboxIndex + 1} / ${state.photos.length}`;
+
+  const cachedPreview = getCachedLightboxPreview(p.id);
+  bindLightboxImageHandlers(img, stage, token, p);
+  if (cachedPreview) {
+    img.src = cachedPreview;
+    if (img.complete && img.naturalWidth > 0) {
+      setLightboxStage(stage, 'ready', '');
+      queueLightboxNeighborPrefetch(state.lightboxIndex);
+    }
+    return;
+  }
+
+  const placeholder = state.lightboxPlaceholderSrc || thumbUrl(p);
+  if (placeholder) img.src = placeholder;
+
+  const controller = new AbortController();
+  state.lightboxMainController = controller;
+  fetch(previewUrl(p, true), { signal: controller.signal, cache: 'force-cache', priority: 'high' })
+    .then((res) => {
+      if (!res.ok) throw new Error(`http_${res.status}`);
+      return res.blob();
+    })
+    .then((blob) => {
+      if (state.lightboxRenderToken !== token || !state.lightboxOpen) return;
+      const objectUrl = URL.createObjectURL(blob);
+      putCachedLightboxPreview(p.id, objectUrl);
+      bindLightboxImageHandlers(img, stage, token, p);
+      img.src = objectUrl;
+    })
+    .catch((err) => {
+      if (controller.signal.aborted) return;
+      if (state.lightboxRenderToken !== token) return;
+      if (String(err?.name || '') === 'AbortError') return;
+      applyLightboxErrorFallback(img, stage, token, p);
+    })
+    .finally(() => {
+      if (state.lightboxMainController === controller) {
+        state.lightboxMainController = null;
+      }
+    });
 }
 
 function downloadCurrent() {
@@ -1307,6 +1724,16 @@ function bindEvents() {
     if (e.key === 'ArrowRight') stepLightbox(1);
     if (e.key.toLowerCase() === 'd') downloadCurrent();
   });
+
+  window.addEventListener('scroll', () => {
+    schedulePruneQueuedTileTasks();
+    scheduleTileLoads();
+  }, { passive: true });
+
+  window.addEventListener('resize', () => {
+    schedulePruneQueuedTileTasks();
+    scheduleTileLoads();
+  }, { passive: true });
 }
 
 (async function init() {
