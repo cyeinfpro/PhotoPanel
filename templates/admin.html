@@ -354,7 +354,7 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
 
   <section class="card" id="scan-card">
     <h3>扫描任务</h3>
-    <div class="muted">支持按年份/项目定向扫描，扫描与转码全量执行直到完成</div>
+    <div class="muted">支持按年份/项目定向扫描，或单独启动转码；两者均全量执行直到完成</div>
     <div style="height:10px"></div>
 
     <div class="row">
@@ -370,13 +370,14 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
 
     <div class="row">
       <label style="display:flex;align-items:center;gap:8px;color:var(--text);margin:0;">
-        <input type="checkbox" id="scan_force" style="width:auto;min-height:auto;"> 强制全量重建（忽略目录 mtime）
+        <input type="checkbox" id="scan_force" style="width:auto;min-height:auto;"> 强制全量重建（仅扫描，忽略目录 mtime）
       </label>
       <div style="text-align:right;display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;">
         <button class="btn" id="transcode-detail-btn" onclick="openTranscodeModal()">转码详情</button>
         <button class="btn" id="pause-scan-btn" onclick="pauseScan()">暂停任务</button>
         <button class="btn" id="resume-scan-btn" onclick="resumeScan()">继续任务</button>
         <button class="btn danger" id="abort-scan-btn" onclick="abortScan()">中断任务</button>
+        <button class="btn" id="start-transcode-btn" onclick="startTranscode()">启动转码</button>
         <button class="btn warn" id="start-scan-btn" onclick="startScan()">启动扫描</button>
       </div>
     </div>
@@ -613,7 +614,7 @@ function normalizeApiError(message) {
     cache_root_not_directory: '缓存目录不是目录',
     cache_root_not_writable: '缓存目录不可写',
     cache_root_prepare_failed: '缓存目录初始化失败',
-    scan_running: '已有扫描任务在运行',
+    scan_running: '已有扫描/转码任务在运行',
     scan_not_running: '当前没有运行中的扫描/转码任务',
     scan_not_paused: '当前任务未暂停',
     scan_abort_already_requested: '已请求中断，正在停止任务',
@@ -1269,16 +1270,38 @@ function setScanControlButtons(s) {
   const paused = !!s.paused;
   const pauseRequested = !!s.pause_requested;
   const abortRequested = !!s.abort_requested;
+  const phase = String(s.phase || '');
   const busyAction = String(state.scanControlBusyAction || '');
 
   const startBtn = qs('start-scan-btn');
+  const startTranscodeBtn = qs('start-transcode-btn');
   const pauseBtn = qs('pause-scan-btn');
   const resumeBtn = qs('resume-scan-btn');
   const abortBtn = qs('abort-scan-btn');
 
   if (startBtn) {
     startBtn.disabled = running || !!busyAction;
-    startBtn.textContent = running ? '扫描进行中' : '启动扫描';
+    if (busyAction === 'start') {
+      startBtn.textContent = '启动中...';
+    } else if (running && phase === 'scanning') {
+      startBtn.textContent = '扫描进行中';
+    } else if (running) {
+      startBtn.textContent = '任务进行中';
+    } else {
+      startBtn.textContent = '启动扫描';
+    }
+  }
+  if (startTranscodeBtn) {
+    startTranscodeBtn.disabled = running || !!busyAction;
+    if (busyAction === 'start_transcode') {
+      startTranscodeBtn.textContent = '启动中...';
+    } else if (running && phase === 'transcoding') {
+      startTranscodeBtn.textContent = '转码进行中';
+    } else if (running) {
+      startTranscodeBtn.textContent = '任务进行中';
+    } else {
+      startTranscodeBtn.textContent = '启动转码';
+    }
   }
   if (pauseBtn) {
     pauseBtn.disabled = !running || paused || pauseRequested || abortRequested || !!busyAction;
@@ -1338,34 +1361,61 @@ async function abortScan() {
   await sendScanControl('abort');
 }
 
+function collectScanScopePayload() {
+  const years = qs('scan_years').value
+    .split(/[,\uFF0C]/)
+    .map(v => v.trim())
+    .filter(Boolean);
+
+  const album_paths = qs('scan_album_paths').value
+    .split(/\r?\n/)
+    .map(v => v.trim().replaceAll('\\', '/').replace(/^\/+|\/+$/g, ''))
+    .filter(Boolean);
+
+  return { years, album_paths };
+}
+
 async function startScan() {
   if (state.scanControlBusyAction) return;
   state.scanControlBusyAction = 'start';
   setScanControlButtons({ running: true, paused: false, pause_requested: false, abort_requested: false });
-  state.transcodeModalManuallyClosed = false;
   try {
-    const years = qs('scan_years').value
-      .split(/[,\uFF0C]/)
-      .map(v => v.trim())
-      .filter(Boolean);
-
-    const album_paths = qs('scan_album_paths').value
-      .split(/\r?\n/)
-      .map(v => v.trim().replaceAll('\\', '/').replace(/^\/+|\/+$/g, ''))
-      .filter(Boolean);
-
+    const payload = collectScanScopePayload();
     const force = qs('scan_force').checked;
 
     await api('/api/admin/albums/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ years, album_paths, force }),
+      body: JSON.stringify({ ...payload, force }),
     });
 
     await loadScanStatus();
     alert('扫描任务已启动');
   } catch (e) {
     alert(`启动扫描失败: ${normalizeApiError(e.message)}`);
+  } finally {
+    state.scanControlBusyAction = '';
+    await loadScanStatus().catch(() => {});
+  }
+}
+
+async function startTranscode() {
+  if (state.scanControlBusyAction) return;
+  state.scanControlBusyAction = 'start_transcode';
+  setScanControlButtons({ running: true, paused: false, pause_requested: false, abort_requested: false, phase: 'transcoding' });
+  state.transcodeModalManuallyClosed = false;
+  try {
+    const payload = collectScanScopePayload();
+    await api('/api/admin/albums/transcode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    await loadScanStatus();
+    openTranscodeModal();
+    alert('转码任务已启动');
+  } catch (e) {
+    alert(`启动转码失败: ${normalizeApiError(e.message)}`);
   } finally {
     state.scanControlBusyAction = '';
     await loadScanStatus().catch(() => {});

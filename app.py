@@ -1761,9 +1761,6 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
         generated_cache_pairs = 0
         completed_cache_tasks = 0
         stop_reason = "no_album_matched" if not albums else None
-
-        cache_tasks = []
-        queued_photo_ids = set()
         recent_cache_items = []
 
         with get_db_conn() as conn:
@@ -1823,12 +1820,6 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                 updated_files += res["updated_files"]
                 deleted_files += res["deleted_files"]
 
-                for _, photo_id, photo_rel, src_mtime, _changed in res["photo_items"]:
-                    if photo_id in queued_photo_ids:
-                        continue
-                    cache_tasks.append((photo_id, photo_rel, src_mtime))
-                    queued_photo_ids.add(photo_id)
-
                 conn.commit()
 
                 set_scan_status(
@@ -1839,120 +1830,6 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                     updated_files=updated_files,
                     deleted_files=deleted_files,
                 )
-
-            # Transcode queue: all photos from scanned projects.
-            if stop_reason != "aborted_by_user":
-                queue_preview = [t[1] for t in cache_tasks[:8]]
-                recent_cache_items = [f"[排队] {p}" for p in queue_preview]
-                current_cache_file = queue_preview[0] if queue_preview else ""
-                set_scan_status(
-                    phase="transcoding",
-                    total_cache_tasks=len(cache_tasks),
-                    completed_cache_tasks=0,
-                    current_cache_file=current_cache_file,
-                    recent_cache_items=recent_cache_items,
-                )
-                if cache_tasks:
-                    pool = ThreadPoolExecutor(max_workers=workers)
-                    future_to_task = {}
-                    pending_index = 0
-                    pending_total = len(cache_tasks)
-                    try:
-                        last_status_push = 0.0
-                        last_done_ts = time.time()
-                        stall_notice_added = False
-
-                        while future_to_task or pending_index < pending_total:
-                            action = check_scan_runtime_control(lock_owner, "transcoding")
-                            if action == "abort":
-                                stop_reason = "aborted_by_user"
-                                break
-                            if lock_owner:
-                                touch_scan_lock(lock_owner)
-
-                            while pending_index < pending_total and len(future_to_task) < workers:
-                                task = cache_tasks[pending_index]
-                                pending_index += 1
-                                fut = pool.submit(preheat_worker, task)
-                                future_to_task[fut] = task
-
-                            if not future_to_task:
-                                continue
-
-                            done, _ = wait(
-                                tuple(future_to_task.keys()),
-                                timeout=1.0,
-                                return_when=FIRST_COMPLETED,
-                            )
-                            if not done:
-                                now = time.time()
-                                pending_task = next(iter(future_to_task.values()), None)
-                                if pending_task:
-                                    current_cache_file = pending_task[1]
-                                if now - last_done_ts >= 20 and not stall_notice_added:
-                                    recent_cache_items.append("[等待] 转码较慢，可能受 SMB 读写速度影响")
-                                    stall_notice_added = True
-                                if now - last_status_push >= 2.0:
-                                    if len(recent_cache_items) > 80:
-                                        recent_cache_items = recent_cache_items[-80:]
-                                    set_scan_status(
-                                        generated_cache_pairs=generated_cache_pairs,
-                                        completed_cache_tasks=completed_cache_tasks,
-                                        current_cache_file=current_cache_file,
-                                        recent_cache_items=recent_cache_items,
-                                    )
-                                    last_status_push = now
-                                continue
-
-                            for fut in done:
-                                task = future_to_task.pop(fut, None)
-                                if task is None:
-                                    continue
-                                try:
-                                    photo_id, rel_path, src_mtime, generated, cache_err = fut.result()
-                                except Exception as exc:
-                                    photo_id, rel_path, src_mtime = task
-                                    generated = False
-                                    cache_err = str(exc)
-
-                                completed_cache_tasks += 1
-                                last_done_ts = time.time()
-                                stall_notice_added = False
-                                current_cache_file = rel_path
-                                if generated:
-                                    generated_cache_pairs += 1
-                                # whether generated or not, cache is now expected to be valid
-                                marker_err = ""
-                                try:
-                                    update_photo_cache_marker(photo_id, src_mtime, "thumb")
-                                    update_photo_cache_marker(photo_id, src_mtime, "preview")
-                                except Exception as marker_exc:
-                                    marker_err = f"marker_update_failed: {marker_exc}"
-                                    logger.warning("Cache marker update failed for %s: %s", rel_path, marker_exc)
-                                if cache_err:
-                                    recent_cache_items.append(f"[失败] {rel_path} ({cache_err})")
-                                elif marker_err:
-                                    recent_cache_items.append(f"[警告] {rel_path} ({marker_err})")
-                                elif generated:
-                                    recent_cache_items.append(f"[生成] {rel_path}")
-                                else:
-                                    recent_cache_items.append(f"[命中] {rel_path}")
-                                if len(recent_cache_items) > 80:
-                                    recent_cache_items = recent_cache_items[-80:]
-
-                                set_scan_status(
-                                    generated_cache_pairs=generated_cache_pairs,
-                                    completed_cache_tasks=completed_cache_tasks,
-                                    current_cache_file=current_cache_file,
-                                    recent_cache_items=recent_cache_items,
-                                )
-                    finally:
-                        if stop_reason == "aborted_by_user" and future_to_task:
-                            for fut in future_to_task:
-                                fut.cancel()
-                            pool.shutdown(wait=False, cancel_futures=True)
-                        else:
-                            pool.shutdown(wait=True)
 
         duration = round(time.time() - start, 2)
         summary.update(
@@ -1967,7 +1844,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                 "deleted_files": deleted_files,
                 "generated_cache_pairs": generated_cache_pairs,
                 "scan_target_albums": scan_target_albums,
-                "total_cache_tasks": len(cache_tasks),
+                "total_cache_tasks": 0,
                 "completed_cache_tasks": completed_cache_tasks,
                 "stop_reason": stop_reason,
             }
@@ -2000,7 +1877,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
             generated_cache_pairs=generated_cache_pairs,
             found_albums=len(albums),
             scan_target_albums=scan_target_albums,
-            total_cache_tasks=len(cache_tasks),
+            total_cache_tasks=0,
             completed_cache_tasks=completed_cache_tasks,
             current_cache_file="",
             recent_cache_items=recent_cache_items,
@@ -2010,6 +1887,305 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
 
     except Exception as exc:
         logger.exception("scan task failed: %s", exc)
+        summary.update({"stop_reason": "exception", "error": str(exc)})
+        set_setting("last_scan_summary", json.dumps(summary, ensure_ascii=False))
+        set_scan_status(
+            running=False,
+            finished_at=int(time.time()),
+            message="failed",
+            phase="idle",
+            paused=False,
+            pause_requested=False,
+            abort_requested=False,
+            current_cache_file="",
+            stop_reason="exception",
+            summary=summary,
+        )
+    finally:
+        update_scan_control_state(pause_requested=False, abort_requested=False)
+        if lock_owner:
+            release_scan_lock(lock_owner)
+
+
+def build_album_scope_sql(years_filter=None, album_filter=None):
+    where = []
+    params = []
+
+    years = sorted({str(v).strip() for v in (years_filter or []) if str(v).strip()})
+    if years:
+        placeholders = ",".join("?" for _ in years)
+        where.append(f"a.year IN ({placeholders})")
+        params.extend(years)
+
+    rels = sorted({normalize_album_rel_path(v) for v in (album_filter or []) if normalize_album_rel_path(v)})
+    if rels:
+        rel_clauses = []
+        for rel in rels:
+            rel_clauses.append("(a.rel_path = ? OR a.rel_path LIKE ? ESCAPE '\\')")
+            params.extend([rel, sql_like_prefix(f"{rel}/")])
+        where.append("(" + " OR ".join(rel_clauses) + ")")
+
+    return where, params
+
+
+def run_transcode_task(trigger, years_filter=None, album_filter=None, lock_owner=None):
+    settings = get_runtime_settings()
+    ensure_runtime_dirs(settings)
+    workers = get_int_setting(settings, "workers", 4, 1, 16)
+    start = time.time()
+    start_ts = int(start)
+
+    set_scan_status(
+        running=True,
+        started_at=start_ts,
+        finished_at=None,
+        trigger=trigger,
+        message="running",
+        phase="transcoding",
+        paused=False,
+        pause_requested=False,
+        abort_requested=False,
+        processed_albums=0,
+        skipped_albums=0,
+        visited_albums=0,
+        scanned_files=0,
+        updated_files=0,
+        deleted_files=0,
+        generated_cache_pairs=0,
+        found_albums=0,
+        scan_target_albums=0,
+        total_cache_tasks=0,
+        completed_cache_tasks=0,
+        current_cache_file="",
+        recent_cache_items=[],
+        stop_reason=None,
+        summary={},
+    )
+
+    summary = {
+        "trigger": trigger,
+        "mode": "transcode_only",
+        "limits": {
+            "workers": workers,
+            "max_scan_albums_per_run": "unlimited",
+            "max_scan_files_per_album": "unlimited",
+            "max_new_thumbs_per_run": "unlimited",
+            "time_budget_seconds": "unlimited",
+        },
+        "years_filter": sorted(list(years_filter or [])),
+        "album_filter": sorted(list(album_filter or [])),
+    }
+
+    stop_reason = None
+    generated_cache_pairs = 0
+    completed_cache_tasks = 0
+    recent_cache_items = []
+    found_albums = 0
+    scan_target_albums = 0
+    cache_tasks = []
+
+    try:
+        with get_db_conn() as conn:
+            where, params = build_album_scope_sql(years_filter=years_filter, album_filter=album_filter)
+            sql = "SELECT a.id FROM albums a"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY a.year DESC, a.name ASC"
+            album_rows = conn.execute(sql, params).fetchall()
+
+            album_ids = [int(r["id"]) for r in album_rows]
+            found_albums = len(album_ids)
+            scan_target_albums = found_albums
+
+            if album_ids:
+                placeholders = ",".join("?" for _ in album_ids)
+                photo_rows = conn.execute(
+                    f"""
+                    SELECT p.id, p.rel_path, p.mtime
+                    FROM photos p
+                    WHERE p.album_id IN ({placeholders})
+                    ORDER BY p.album_id ASC, p.filename ASC
+                    """,
+                    album_ids,
+                ).fetchall()
+                cache_tasks = [(int(r["id"]), r["rel_path"], r["mtime"]) for r in photo_rows]
+            else:
+                cache_tasks = []
+
+        if not cache_tasks:
+            stop_reason = "no_album_matched"
+
+        queue_preview = [t[1] for t in cache_tasks[:8]]
+        recent_cache_items = [f"[排队] {p}" for p in queue_preview]
+        current_cache_file = queue_preview[0] if queue_preview else ""
+        set_scan_status(
+            found_albums=found_albums,
+            scan_target_albums=scan_target_albums,
+            processed_albums=found_albums,
+            skipped_albums=0,
+            visited_albums=found_albums,
+            phase="transcoding",
+            total_cache_tasks=len(cache_tasks),
+            completed_cache_tasks=0,
+            current_cache_file=current_cache_file,
+            recent_cache_items=recent_cache_items,
+        )
+
+        if stop_reason != "aborted_by_user" and cache_tasks:
+            pool = ThreadPoolExecutor(max_workers=workers)
+            future_to_task = {}
+            pending_index = 0
+            pending_total = len(cache_tasks)
+            try:
+                last_status_push = 0.0
+                last_done_ts = time.time()
+                stall_notice_added = False
+
+                while future_to_task or pending_index < pending_total:
+                    action = check_scan_runtime_control(lock_owner, "transcoding")
+                    if action == "abort":
+                        stop_reason = "aborted_by_user"
+                        break
+                    if lock_owner:
+                        touch_scan_lock(lock_owner)
+
+                    while pending_index < pending_total and len(future_to_task) < workers:
+                        task = cache_tasks[pending_index]
+                        pending_index += 1
+                        fut = pool.submit(preheat_worker, task)
+                        future_to_task[fut] = task
+
+                    if not future_to_task:
+                        continue
+
+                    done, _ = wait(
+                        tuple(future_to_task.keys()),
+                        timeout=1.0,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        now = time.time()
+                        pending_task = next(iter(future_to_task.values()), None)
+                        if pending_task:
+                            current_cache_file = pending_task[1]
+                        if now - last_done_ts >= 20 and not stall_notice_added:
+                            recent_cache_items.append("[等待] 转码较慢，可能受 SMB 读写速度影响")
+                            stall_notice_added = True
+                        if now - last_status_push >= 2.0:
+                            if len(recent_cache_items) > 80:
+                                recent_cache_items = recent_cache_items[-80:]
+                            set_scan_status(
+                                generated_cache_pairs=generated_cache_pairs,
+                                completed_cache_tasks=completed_cache_tasks,
+                                current_cache_file=current_cache_file,
+                                recent_cache_items=recent_cache_items,
+                            )
+                            last_status_push = now
+                        continue
+
+                    for fut in done:
+                        task = future_to_task.pop(fut, None)
+                        if task is None:
+                            continue
+                        try:
+                            photo_id, rel_path, src_mtime, generated, cache_err = fut.result()
+                        except Exception as exc:
+                            photo_id, rel_path, src_mtime = task
+                            generated = False
+                            cache_err = str(exc)
+
+                        completed_cache_tasks += 1
+                        last_done_ts = time.time()
+                        stall_notice_added = False
+                        current_cache_file = rel_path
+                        if generated:
+                            generated_cache_pairs += 1
+                        marker_err = ""
+                        try:
+                            update_photo_cache_marker(photo_id, src_mtime, "thumb")
+                            update_photo_cache_marker(photo_id, src_mtime, "preview")
+                        except Exception as marker_exc:
+                            marker_err = f"marker_update_failed: {marker_exc}"
+                            logger.warning("Cache marker update failed for %s: %s", rel_path, marker_exc)
+                        if cache_err:
+                            recent_cache_items.append(f"[失败] {rel_path} ({cache_err})")
+                        elif marker_err:
+                            recent_cache_items.append(f"[警告] {rel_path} ({marker_err})")
+                        elif generated:
+                            recent_cache_items.append(f"[生成] {rel_path}")
+                        else:
+                            recent_cache_items.append(f"[命中] {rel_path}")
+                        if len(recent_cache_items) > 80:
+                            recent_cache_items = recent_cache_items[-80:]
+
+                        set_scan_status(
+                            generated_cache_pairs=generated_cache_pairs,
+                            completed_cache_tasks=completed_cache_tasks,
+                            current_cache_file=current_cache_file,
+                            recent_cache_items=recent_cache_items,
+                        )
+            finally:
+                if stop_reason == "aborted_by_user" and future_to_task:
+                    for fut in future_to_task:
+                        fut.cancel()
+                    pool.shutdown(wait=False, cancel_futures=True)
+                else:
+                    pool.shutdown(wait=True)
+
+        duration = round(time.time() - start, 2)
+        summary.update(
+            {
+                "duration_seconds": duration,
+                "found_albums": found_albums,
+                "processed_albums": found_albums,
+                "skipped_albums": 0,
+                "visited_albums": found_albums,
+                "scanned_files": 0,
+                "updated_files": 0,
+                "deleted_files": 0,
+                "generated_cache_pairs": generated_cache_pairs,
+                "scan_target_albums": scan_target_albums,
+                "total_cache_tasks": len(cache_tasks),
+                "completed_cache_tasks": completed_cache_tasks,
+                "stop_reason": stop_reason,
+            }
+        )
+        set_setting("last_scan_summary", json.dumps(summary, ensure_ascii=False))
+
+        final_message = "completed"
+        if stop_reason == "aborted_by_user":
+            final_message = "aborted"
+        elif stop_reason == "no_album_matched":
+            final_message = "completed_no_match"
+        elif stop_reason:
+            final_message = "completed_with_notice"
+
+        set_scan_status(
+            running=False,
+            finished_at=int(time.time()),
+            message=final_message,
+            phase="idle",
+            paused=False,
+            pause_requested=False,
+            abort_requested=False,
+            processed_albums=found_albums,
+            skipped_albums=0,
+            visited_albums=found_albums,
+            scanned_files=0,
+            updated_files=0,
+            deleted_files=0,
+            generated_cache_pairs=generated_cache_pairs,
+            found_albums=found_albums,
+            scan_target_albums=scan_target_albums,
+            total_cache_tasks=len(cache_tasks),
+            completed_cache_tasks=completed_cache_tasks,
+            current_cache_file="",
+            recent_cache_items=recent_cache_items,
+            stop_reason=stop_reason,
+            summary=summary,
+        )
+    except Exception as exc:
+        logger.exception("transcode task failed: %s", exc)
         summary.update({"stop_reason": "exception", "error": str(exc)})
         set_setting("last_scan_summary", json.dumps(summary, ensure_ascii=False))
         set_scan_status(
@@ -2040,6 +2216,25 @@ def start_scan(trigger="manual", years_filter=None, album_filter=None, force=Fal
         th = threading.Thread(
             target=run_scan_task,
             args=(trigger, years_filter, album_filter, force, lock_owner),
+            daemon=True,
+        )
+        th.start()
+        return True
+    except Exception:
+        release_scan_lock(lock_owner)
+        raise
+
+
+def start_transcode(trigger="manual", years_filter=None, album_filter=None):
+    lock_owner = try_acquire_scan_lock()
+    if not lock_owner:
+        return False
+
+    try:
+        update_scan_control_state(pause_requested=False, abort_requested=False)
+        th = threading.Thread(
+            target=run_transcode_task,
+            args=(trigger, years_filter, album_filter, lock_owner),
             daemon=True,
         )
         th.start()
@@ -3001,6 +3196,28 @@ def admin_scan_albums():
     force = parse_bool(data.get("force", False))
 
     if not start_scan(trigger="manual", years_filter=years_filter, album_filter=album_filter, force=force):
+        return jsonify({"error": "scan_running"}), 409
+
+    return jsonify({"ok": True, "status": "started"})
+
+
+@app.route("/api/admin/albums/transcode", methods=["POST"])
+@admin_required
+def admin_transcode_albums():
+    data = request.get_json(silent=True) or {}
+
+    years_filter = normalize_years_filter(data.get("years"))
+    album_filter = normalize_album_filter(data.get("album_paths"))
+
+    cfg = get_runtime_settings()
+    _, photo_root_err, photo_root_detail = check_photo_root_access(cfg.get("photo_root"), must_be_absolute=False)
+    if photo_root_err:
+        payload = {"error": photo_root_err}
+        if photo_root_detail:
+            payload["detail"] = photo_root_detail
+        return jsonify(payload), 400
+
+    if not start_transcode(trigger="manual", years_filter=years_filter, album_filter=album_filter):
         return jsonify({"error": "scan_running"}), 409
 
     return jsonify({"ok": True, "status": "started"})
