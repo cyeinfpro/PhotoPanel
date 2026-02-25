@@ -3396,46 +3396,138 @@ def admin_album_publish(album_id):
     return jsonify({"ok": True, "published": published})
 
 
+def normalize_acl_user_ids(raw_user_ids):
+    if not isinstance(raw_user_ids, list):
+        return None
+    out = set()
+    for uid in raw_user_ids:
+        try:
+            n = int(uid)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            out.add(n)
+    return sorted(out)
+
+
+def query_active_user_ids(conn, user_ids):
+    if not user_ids:
+        return []
+    placeholders = ",".join("?" for _ in user_ids)
+    rows = conn.execute(
+        f"SELECT id FROM users WHERE id IN ({placeholders}) AND active = 1",
+        user_ids,
+    ).fetchall()
+    return sorted({int(r["id"]) for r in rows})
+
+
+def replace_acl_for_albums(conn, album_ids, valid_user_ids):
+    target_album_ids = sorted({int(v) for v in album_ids if int(v) > 0})
+    if not target_album_ids:
+        return
+
+    placeholders = ",".join("?" for _ in target_album_ids)
+    conn.execute(f"DELETE FROM user_album_acl WHERE album_id IN ({placeholders})", target_album_ids)
+
+    if not valid_user_ids:
+        return
+
+    rows = [(uid, aid) for aid in target_album_ids for uid in valid_user_ids]
+    conn.executemany(
+        "INSERT INTO user_album_acl(user_id, album_id, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+        rows,
+    )
+
+
 @app.route("/api/admin/albums/<int:album_id>/acl", methods=["POST"])
 @admin_required
 def admin_album_acl(album_id):
     data = request.get_json(silent=True) or {}
-    user_ids = data.get("user_ids")
-
-    if not isinstance(user_ids, list):
+    normalized_ids = normalize_acl_user_ids(data.get("user_ids"))
+    if normalized_ids is None:
         return jsonify({"error": "user_ids_must_be_array"}), 400
-
-    normalized_ids = []
-    for uid in user_ids:
-        try:
-            normalized_ids.append(int(uid))
-        except (TypeError, ValueError):
-            continue
 
     with get_db_conn() as conn:
         album = conn.execute("SELECT id FROM albums WHERE id = ?", (album_id,)).fetchone()
         if not album:
             return jsonify({"error": "album_not_found"}), 404
+        valid_ids = query_active_user_ids(conn, normalized_ids)
+        replace_acl_for_albums(conn, [album_id], valid_ids)
 
-        if normalized_ids:
-            placeholders = ",".join("?" for _ in normalized_ids)
-            valid_users = conn.execute(
-                f"SELECT id FROM users WHERE id IN ({placeholders}) AND active = 1",
-                normalized_ids,
+    return jsonify({"ok": True, "assigned_user_ids": valid_ids})
+
+
+@app.route("/api/admin/albums/acl/batch", methods=["POST"])
+@admin_required
+def admin_album_acl_batch():
+    data = request.get_json(silent=True) or {}
+    scope = str(data.get("scope") or "").strip().lower()
+    normalized_ids = normalize_acl_user_ids(data.get("user_ids"))
+    if normalized_ids is None:
+        return jsonify({"error": "user_ids_must_be_array"}), 400
+
+    target_rows = []
+    target_desc = ""
+
+    with get_db_conn() as conn:
+        if scope == "folder":
+            raw_prefix = str(data.get("path_prefix") or "").strip()
+            if not raw_prefix:
+                return jsonify({"error": "acl_scope_prefix_required"}), 400
+            prefix = normalize_album_folder_path(raw_prefix)
+            if prefix is None or not prefix:
+                return jsonify({"error": "acl_scope_prefix_invalid"}), 400
+
+            like_pattern = sql_like_prefix(f"{prefix}/")
+            target_rows = conn.execute(
+                """
+                SELECT id, rel_path
+                FROM albums
+                WHERE rel_path = ? OR rel_path LIKE ? ESCAPE '\\'
+                ORDER BY year DESC, name ASC
+                """,
+                (prefix, like_pattern),
             ).fetchall()
-            valid_ids = {r["id"] for r in valid_users}
+            target_desc = prefix
+
+        elif scope == "year":
+            raw_year = str(data.get("year") or "").strip()
+            if not raw_year:
+                return jsonify({"error": "acl_scope_year_required"}), 400
+            if "/" in raw_year or "\\" in raw_year or raw_year in {".", ".."}:
+                return jsonify({"error": "acl_scope_year_invalid"}), 400
+
+            target_rows = conn.execute(
+                """
+                SELECT id, rel_path
+                FROM albums
+                WHERE year = ?
+                ORDER BY name ASC
+                """,
+                (raw_year,),
+            ).fetchall()
+            target_desc = raw_year
+
         else:
-            valid_ids = set()
+            return jsonify({"error": "acl_scope_invalid"}), 400
 
-        conn.execute("DELETE FROM user_album_acl WHERE album_id = ?", (album_id,))
+        if not target_rows:
+            return jsonify({"error": "acl_target_not_found"}), 404
 
-        for uid in sorted(valid_ids):
-            conn.execute(
-                "INSERT INTO user_album_acl(user_id, album_id, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                (uid, album_id),
-            )
+        album_ids = [int(r["id"]) for r in target_rows]
+        valid_ids = query_active_user_ids(conn, normalized_ids)
+        replace_acl_for_albums(conn, album_ids, valid_ids)
 
-    return jsonify({"ok": True, "assigned_user_ids": sorted(list(valid_ids))})
+    return jsonify(
+        {
+            "ok": True,
+            "scope": scope,
+            "target": target_desc,
+            "matched_albums": len(target_rows),
+            "matched_album_ids": album_ids,
+            "assigned_user_ids": valid_ids,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -488,21 +488,52 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
 
   <section class="card" id="acl-card">
     <h3>ACL 授权</h3>
-    <div class="muted">为指定项目分配可见用户（普通用户）</div>
+    <div class="muted">支持按单项目、项目文件夹、年份总目录批量分配可见用户（普通用户）</div>
     <div style="height:10px"></div>
 
     <div class="row">
       <div>
+        <label>授权范围</label>
+        <select id="acl_scope_mode" onchange="onAclScopeModeChange()">
+          <option value="album">单项目（当前选中）</option>
+          <option value="folder">项目文件夹（按路径前缀）</option>
+          <option value="year">总文件夹（按年份）</option>
+        </select>
+      </div>
+      <div>
         <label>当前项目</label>
         <input id="acl_album" readonly placeholder="请在上方相册列表点击“授权”">
       </div>
+    </div>
+
+    <div class="row" id="acl_scope_folder_row" style="display:none;">
+      <div>
+        <label>项目文件夹前缀</label>
+        <input id="acl_scope_prefix" placeholder="例如：2025/春季活动" oninput="updateAclScopeHint()">
+      </div>
       <div style="display:flex;align-items:flex-end;gap:8px;">
-        <button class="btn" onclick="selectAllAclUsers()">全选</button>
-        <button class="btn" onclick="clearAclUsers()">清空</button>
-        <button class="btn primary" onclick="saveAcl()">保存 ACL</button>
+        <button class="btn" onclick="fillAclPrefixFromCurrent()">使用当前项目上级目录</button>
       </div>
     </div>
 
+    <div class="row" id="acl_scope_year_row" style="display:none;">
+      <div>
+        <label>年份目录</label>
+        <input id="acl_scope_year" placeholder="例如：2025" oninput="updateAclScopeHint()">
+      </div>
+      <div style="display:flex;align-items:flex-end;gap:8px;">
+        <button class="btn" onclick="fillAclYearFromCurrent()">使用当前项目年份</button>
+      </div>
+    </div>
+
+    <div class="muted" id="acl_scope_hint">当前范围：单项目。请先在上方相册列表点击“授权”选择项目。</div>
+    <div style="height:10px"></div>
+    <div style="display:flex;align-items:flex-end;gap:8px;">
+      <button class="btn" onclick="selectAllAclUsers()">全选</button>
+      <button class="btn" onclick="clearAclUsers()">清空</button>
+      <button class="btn primary" onclick="saveAcl()">保存 ACL</button>
+    </div>
+    <div style="height:8px"></div>
     <div class="checkbox-list" id="acl-user-list"></div>
   </section>
 </main>
@@ -588,6 +619,12 @@ function normalizeApiError(message) {
     scan_abort_already_requested: '已请求中断，正在停止任务',
     scan_control_invalid_action: '无效的任务控制动作',
     panel_update_running: '已有更新任务在运行',
+    acl_scope_invalid: '授权范围无效',
+    acl_scope_prefix_required: '项目文件夹前缀不能为空',
+    acl_scope_prefix_invalid: '项目文件夹前缀非法',
+    acl_scope_year_required: '年份不能为空',
+    acl_scope_year_invalid: '年份目录格式非法',
+    acl_target_not_found: '未匹配到任何项目',
   };
   const readable = map[code] || code;
   return detail ? `${readable}: ${detail}` : readable;
@@ -976,6 +1013,20 @@ async function loadAlbums() {
   const data = await api(`/api/admin/albums?${params.toString()}`);
   state.albums = data.albums || [];
   renderAlbums();
+  if (state.selectedAlbumId) {
+    const selected = state.albums.find(a => a.id === state.selectedAlbumId);
+    if (selected) {
+      selectAlbumForAcl(selected.id);
+    } else {
+      state.selectedAlbumId = null;
+      state.selectedAlbumName = '';
+      qs('acl_album').value = '';
+      renderAclUserList();
+    }
+  } else {
+    renderAclUserList();
+  }
+  updateAclScopeHint();
 }
 
 function renderAlbums() {
@@ -1028,6 +1079,73 @@ function selectFirstAlbum() {
   selectAlbumForAcl(state.albums[0].id);
 }
 
+function getSelectedAlbumForAcl() {
+  return state.albums.find(a => a.id === state.selectedAlbumId) || null;
+}
+
+function normalizeAclPrefixPath(raw) {
+  return String(raw || '')
+    .trim()
+    .replaceAll('\\', '/')
+    .replace(/^\/+|\/+$/g, '');
+}
+
+function updateAclScopeHint() {
+  const mode = String(qs('acl_scope_mode')?.value || 'album');
+  const album = getSelectedAlbumForAcl();
+  let hint = '';
+  if (mode === 'album') {
+    hint = album
+      ? `当前范围：单项目（${album.rel_path}）`
+      : '当前范围：单项目。请先在上方相册列表点击“授权”选择项目。';
+  } else if (mode === 'folder') {
+    const prefix = normalizeAclPrefixPath(qs('acl_scope_prefix')?.value || '');
+    hint = prefix
+      ? `当前范围：项目文件夹前缀 “${prefix}” 下所有项目`
+      : '当前范围：项目文件夹。请输入路径前缀（例如 2025/春季活动）。';
+  } else if (mode === 'year') {
+    const year = String(qs('acl_scope_year')?.value || '').trim();
+    hint = year
+      ? `当前范围：年份目录 “${year}” 下所有项目`
+      : '当前范围：年份目录。请输入年份（例如 2025）。';
+  }
+  qs('acl_scope_hint').textContent = hint;
+}
+
+function onAclScopeModeChange() {
+  const mode = String(qs('acl_scope_mode')?.value || 'album');
+  qs('acl_scope_folder_row').style.display = mode === 'folder' ? 'grid' : 'none';
+  qs('acl_scope_year_row').style.display = mode === 'year' ? 'grid' : 'none';
+  updateAclScopeHint();
+}
+
+function fillAclPrefixFromCurrent() {
+  const album = getSelectedAlbumForAcl();
+  if (!album) {
+    alert('请先在上方相册列表点击“授权”选择项目');
+    return;
+  }
+  const rel = normalizeAclPrefixPath(album.rel_path || '');
+  const parts = rel.split('/').filter(Boolean);
+  const prefix = parts.length > 1 ? parts.slice(0, -1).join('/') : rel;
+  qs('acl_scope_mode').value = 'folder';
+  qs('acl_scope_prefix').value = prefix;
+  onAclScopeModeChange();
+}
+
+function fillAclYearFromCurrent() {
+  const album = getSelectedAlbumForAcl();
+  if (!album) {
+    alert('请先在上方相册列表点击“授权”选择项目');
+    return;
+  }
+  const rel = normalizeAclPrefixPath(album.rel_path || '');
+  const fallbackYear = rel.split('/').filter(Boolean)[0] || '';
+  qs('acl_scope_mode').value = 'year';
+  qs('acl_scope_year').value = String(album.year || fallbackYear || '').trim();
+  onAclScopeModeChange();
+}
+
 function selectAlbumForAcl(albumId) {
   const album = state.albums.find(a => a.id === albumId);
   if (!album) return;
@@ -1036,6 +1154,18 @@ function selectAlbumForAcl(albumId) {
   state.selectedAlbumName = `${album.rel_path} (#${album.id})`;
   qs('acl_album').value = state.selectedAlbumName;
 
+  if (!normalizeAclPrefixPath(qs('acl_scope_prefix').value)) {
+    const rel = normalizeAclPrefixPath(album.rel_path || '');
+    const parts = rel.split('/').filter(Boolean);
+    const prefix = parts.length > 1 ? parts.slice(0, -1).join('/') : rel;
+    qs('acl_scope_prefix').value = prefix;
+  }
+  if (!String(qs('acl_scope_year').value || '').trim()) {
+    const rel = normalizeAclPrefixPath(album.rel_path || '');
+    const fallbackYear = rel.split('/').filter(Boolean)[0] || '';
+    qs('acl_scope_year').value = String(album.year || fallbackYear || '').trim();
+  }
+  updateAclScopeHint();
   renderAclUserList(album.acl_user_ids || []);
 }
 
@@ -1080,21 +1210,58 @@ function clearAclUsers() {
 }
 
 async function saveAcl() {
-  if (!state.selectedAlbumId) {
-    alert('请先在上方相册列表中点击“授权”选择项目');
+  const mode = String(qs('acl_scope_mode')?.value || 'album');
+  const user_ids = getSelectedAclUserIds();
+  let result = null;
+  let affectedAlbums = 1;
+  if (mode === 'album') {
+    if (!state.selectedAlbumId) {
+      alert('请先在上方相册列表中点击“授权”选择项目');
+      return;
+    }
+    result = await api(`/api/admin/albums/${state.selectedAlbumId}/acl`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_ids }),
+    });
+    affectedAlbums = 1;
+  } else if (mode === 'folder') {
+    const path_prefix = normalizeAclPrefixPath(qs('acl_scope_prefix').value);
+    if (!path_prefix) {
+      alert('请填写项目文件夹前缀，例如 2025/春季活动');
+      return;
+    }
+    result = await api('/api/admin/albums/acl/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'folder', path_prefix, user_ids }),
+    });
+    affectedAlbums = Number(result?.matched_albums || 0);
+  } else if (mode === 'year') {
+    const year = String(qs('acl_scope_year').value || '').trim();
+    if (!year) {
+      alert('请填写年份，例如 2025');
+      return;
+    }
+    result = await api('/api/admin/albums/acl/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'year', year, user_ids }),
+    });
+    affectedAlbums = Number(result?.matched_albums || 0);
+  } else {
+    alert('授权范围无效，请刷新后重试');
     return;
   }
 
-  const user_ids = getSelectedAclUserIds();
-  await api(`/api/admin/albums/${state.selectedAlbumId}/acl`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ user_ids }),
-  });
-
   await loadAlbums();
-  selectAlbumForAcl(state.selectedAlbumId);
-  alert('ACL 已保存');
+  if (state.selectedAlbumId) {
+    const exists = state.albums.find(a => a.id === state.selectedAlbumId);
+    if (exists) selectAlbumForAcl(state.selectedAlbumId);
+  }
+  updateAclScopeHint();
+  const assignedUsers = Number(result?.assigned_user_ids?.length || user_ids.length || 0);
+  alert(`ACL 已保存：已覆盖 ${affectedAlbums} 个项目，授权用户 ${assignedUsers} 个`);
 }
 
 function setScanControlButtons(s) {
@@ -1326,6 +1493,7 @@ function escapeHtml(v) {
 }
 
 async function init() {
+  onAclScopeModeChange();
   try {
     await Promise.all([loadSettings(), loadUsers(), loadAlbums(), loadScanStatus()]);
   } catch (e) {
