@@ -637,14 +637,19 @@ async function saveSettings() {
       exclude_dirs: qs('exclude_dirs').value.trim(),
     };
 
-    await api('/api/admin/settings', {
+    const result = await api('/api/admin/settings', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
 
     await loadSettings();
-    alert('设置已保存');
+    const warnings = Array.isArray(result?.warnings) ? result.warnings : [];
+    if (warnings.length > 0) {
+      alert(`设置已保存\n${warnings.join('\n')}`);
+    } else {
+      alert('设置已保存');
+    }
   } catch (e) {
     alert(`保存失败: ${normalizeApiError(e.message)}`);
   } finally {

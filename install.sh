@@ -3,7 +3,8 @@ set -euo pipefail
 
 REPO_URL="https://github.com/cyeinfpro/PhotoPanel"
 APP_DIR="/opt/PhotoPanel"
-RUN_USER="photopanel"
+RUN_USER="root"
+RUN_GROUP="root"
 ENV_FILE="/etc/photopanel.env"
 SERVICE_FILE="/etc/systemd/system/photopanel.service"
 SERVICE_NAME="photopanel"
@@ -103,9 +104,11 @@ ensure_runtime_user_and_dirs() {
   local cache_root="$2"
   local data_root="$3"
 
-  id -u "${RUN_USER}" >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -m "${RUN_USER}"
+  if [[ "${RUN_USER}" != "root" ]]; then
+    id -u "${RUN_USER}" >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -m "${RUN_USER}"
+  fi
   mkdir -p "${photo_root}" "${cache_root}" "${data_root}"
-  chown -R "${RUN_USER}:${RUN_USER}" "${cache_root}" "${data_root}"
+  chown -R "${RUN_USER}:${RUN_GROUP}" "${cache_root}" "${data_root}"
   chmod -R u+rwX "${cache_root}" "${data_root}" || true
 }
 
@@ -286,19 +289,19 @@ EOF
 }
 
 write_service_file() {
-  cat > "${SERVICE_FILE}" <<'EOF'
+  cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=PhotoNest Service
 After=network.target
 
 [Service]
 Type=simple
-User=photopanel
-Group=photopanel
-WorkingDirectory=/opt/PhotoPanel
-EnvironmentFile=/etc/photopanel.env
-ExecStart=/opt/PhotoPanel/.venv/bin/gunicorn \
-  --bind 0.0.0.0:${PORT} \
+User=${RUN_USER}
+Group=${RUN_GROUP}
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${ENV_FILE}
+ExecStart=${APP_DIR}/.venv/bin/gunicorn \
+  --bind 0.0.0.0:\${PORT} \
   --workers 4 \
   --threads 4 \
   --timeout 120 \
@@ -516,9 +519,11 @@ uninstall_panel() {
   fi
 
   read -r -p "是否删除运行用户 ${RUN_USER}? [y/N]: " remove_user
-  if [[ "${remove_user}" =~ ^[Yy]$ ]]; then
+  if [[ "${RUN_USER}" != "root" && "${remove_user}" =~ ^[Yy]$ ]]; then
     userdel -r "${RUN_USER}" >/dev/null 2>&1 || true
     echo "已尝试删除运行用户 ${RUN_USER}"
+  elif [[ "${RUN_USER}" == "root" ]]; then
+    echo "运行用户为 root，跳过删除用户步骤"
   fi
 
   echo

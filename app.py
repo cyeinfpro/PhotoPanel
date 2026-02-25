@@ -820,6 +820,35 @@ def check_cache_root_access(raw_path, must_be_absolute=True):
     return path_obj, "", ""
 
 
+def resolve_cache_root_path(raw_path, must_be_absolute=True, allow_fallback=True):
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return None, "cache_root_empty", "", False
+
+    requested = Path(raw).expanduser()
+    if must_be_absolute and not requested.is_absolute():
+        return None, "cache_root_must_be_absolute", "", False
+
+    candidates = [str(requested)]
+    if allow_fallback:
+        candidates = _cache_root_candidates(str(requested))
+
+    errors = []
+    for c in candidates:
+        candidate = Path(c).expanduser()
+        if must_be_absolute and not candidate.is_absolute():
+            continue
+        try:
+            prepared = _prepare_cache_root(str(candidate))
+            used_fallback = str(Path(prepared)) != str(requested)
+            return Path(prepared), "", "", used_fallback
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+
+    detail = "; ".join(errors[-5:]) if errors else "unknown_error"
+    return None, "cache_root_prepare_failed", detail, False
+
+
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -2391,6 +2420,7 @@ def admin_settings():
         )
 
     data = request.get_json(silent=True) or {}
+    warnings = []
 
     if "photo_root" in data:
         p, err, detail = check_photo_root_access(data["photo_root"], must_be_absolute=True)
@@ -2402,13 +2432,20 @@ def admin_settings():
         set_setting("photo_root", str(p))
 
     if "cache_root" in data:
-        p, err, detail = check_cache_root_access(data["cache_root"], must_be_absolute=True)
+        requested_cache_root = str(data["cache_root"] or "").strip()
+        p, err, detail, used_fallback = resolve_cache_root_path(
+            requested_cache_root,
+            must_be_absolute=True,
+            allow_fallback=True,
+        )
         if err:
             payload = {"error": err}
             if detail:
                 payload["detail"] = detail
             return jsonify(payload), 400
         set_setting("cache_root", str(p))
+        if used_fallback:
+            warnings.append(f"缓存目录不可写，已自动回退到: {p}")
 
     int_fields = [
         ("max_scan_albums_per_run", 1, 50000),
@@ -2451,7 +2488,17 @@ def admin_settings():
     except OSError as exc:
         return jsonify({"error": "cache_root_prepare_failed", "detail": str(exc)}), 400
 
-    return jsonify({"ok": True})
+    effective = get_runtime_settings(force_refresh=True)
+    return jsonify(
+        {
+            "ok": True,
+            "warnings": warnings,
+            "effective": {
+                "photo_root": effective.get("photo_root", ""),
+                "cache_root": effective.get("cache_root", ""),
+            },
+        }
+    )
 
 
 @app.route("/api/admin/users", methods=["GET", "POST"])
