@@ -378,10 +378,12 @@ body {
 
 .lb-main {
   margin: auto;
-  width: min(94vw, 1500px);
-  height: min(94vh, 980px);
-  display: grid;
-  grid-template-rows: auto 1fr auto;
+  width: 94vw;
+  max-width: 1500px;
+  height: 94vh;
+  max-height: 980px;
+  display: flex;
+  flex-direction: column;
   gap: 10px;
 }
 
@@ -415,23 +417,63 @@ body {
 
 .lb-stage {
   position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
   border-radius: 18px;
   overflow: hidden;
   background: rgba(255, 255, 255, 0.06);
-  display: grid;
-  place-items: center;
+}
+
+.lb-stage-media {
+  position: absolute;
+  inset: 0;
+  padding: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .lb-stage img {
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
   object-fit: contain;
+  object-position: center center;
+  display: block;
+}
+
+.lb-stage-msg {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 14px;
+  pointer-events: none;
+  user-select: none;
+}
+
+.lb-stage.loading #lb-img {
+  visibility: hidden;
+}
+
+.lb-stage.ready #lb-img,
+.lb-stage.error #lb-img {
+  visibility: visible;
+}
+
+.lb-stage.ready .lb-stage-msg {
+  display: none;
+}
+
+.lb-stage.error .lb-stage-msg {
+  color: rgba(255, 170, 170, 0.95);
 }
 
 .lb-nav {
   position: absolute;
   top: 50%;
   transform: translateY(-50%);
+  z-index: 2;
   width: 42px;
   height: 42px;
   border: none;
@@ -514,9 +556,12 @@ body {
         <button class="lb-btn" onclick="closeLightbox()">关闭</button>
       </div>
     </div>
-    <div class="lb-stage" id="lb-stage">
+    <div class="lb-stage ready" id="lb-stage">
       <button class="lb-nav prev" onclick="stepLightbox(-1)">&#8249;</button>
-      <img id="lb-img" alt="preview">
+      <div class="lb-stage-media">
+        <img id="lb-img" alt="preview">
+      </div>
+      <div class="lb-stage-msg" id="lb-stage-msg">加载预览中...</div>
       <button class="lb-nav next" onclick="stepLightbox(1)">&#8250;</button>
     </div>
     <div class="lb-head">
@@ -543,6 +588,7 @@ const state = {
   loading: false,
   query: '',
   lightboxIndex: -1,
+  lightboxRenderToken: '',
 };
 
 function qs(id) { return document.getElementById(id); }
@@ -662,6 +708,24 @@ function decodeURIComponentSafe(value) {
 function showActionError(prefix, error) {
   const msg = String(error?.message || error || '请求失败');
   alert(`${prefix}: ${msg}`);
+}
+
+function setLightboxStage(stage, status, text) {
+  stage.classList.remove('loading', 'ready', 'error');
+  stage.classList.add(status);
+  qs('lb-stage-msg').textContent = text || '';
+}
+
+function previewUrl(photo) {
+  const mtime = Number(photo?.mtime || 0);
+  const suffix = mtime > 0 ? `?v=${Math.floor(mtime)}` : '';
+  return `/api/preview/${photo.id}${suffix}`;
+}
+
+function fallbackOriginalUrl(photo) {
+  const mtime = Number(photo?.mtime || 0);
+  const suffix = mtime > 0 ? `&v=${Math.floor(mtime)}` : '';
+  return `/api/download/${photo.id}?inline=1${suffix}`;
 }
 
 function openYearFromEl(el) {
@@ -847,6 +911,7 @@ function openLightboxById(photoId) {
 
 function closeLightbox() {
   qs('lightbox').classList.remove('show');
+  state.lightboxRenderToken = '';
   document.body.style.overflow = '';
 }
 
@@ -859,7 +924,29 @@ function stepLightbox(delta) {
 function renderLightbox() {
   const p = state.photos[state.lightboxIndex];
   if (!p) return;
-  qs('lb-img').src = `/api/preview/${p.id}`;
+  const img = qs('lb-img');
+  const stage = qs('lb-stage');
+  const token = `${p.id}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  state.lightboxRenderToken = token;
+
+  setLightboxStage(stage, 'loading', '加载预览中...');
+  img.dataset.token = token;
+  img.dataset.fallbackTried = '0';
+  img.onerror = () => {
+    if (state.lightboxRenderToken !== token) return;
+    if (img.dataset.fallbackTried !== '1') {
+      img.dataset.fallbackTried = '1';
+      setLightboxStage(stage, 'loading', '预览异常，切换原图...');
+      img.src = fallbackOriginalUrl(p);
+      return;
+    }
+    setLightboxStage(stage, 'error', '图片加载失败，可点击“下载原图”');
+  };
+  img.onload = () => {
+    if (state.lightboxRenderToken !== token) return;
+    setLightboxStage(stage, 'ready', '');
+  };
+  img.src = previewUrl(p);
   qs('lb-title').textContent = p.filename;
   qs('lb-counter').textContent = `${state.lightboxIndex + 1} / ${state.photos.length}`;
 }
