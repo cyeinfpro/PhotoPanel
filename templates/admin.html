@@ -377,6 +377,7 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
         <button class="btn" id="pause-scan-btn" onclick="pauseScan()">暂停任务</button>
         <button class="btn" id="resume-scan-btn" onclick="resumeScan()">继续任务</button>
         <button class="btn danger" id="abort-scan-btn" onclick="abortScan()">中断任务</button>
+        <button class="btn danger" id="start-transcode-force-btn" onclick="startTranscodeForce()">强制重新转码</button>
         <button class="btn" id="start-transcode-btn" onclick="startTranscode()">启动转码</button>
         <button class="btn warn" id="start-scan-btn" onclick="startScan()">启动扫描</button>
       </div>
@@ -1275,6 +1276,7 @@ function setScanControlButtons(s) {
 
   const startBtn = qs('start-scan-btn');
   const startTranscodeBtn = qs('start-transcode-btn');
+  const startTranscodeForceBtn = qs('start-transcode-force-btn');
   const pauseBtn = qs('pause-scan-btn');
   const resumeBtn = qs('resume-scan-btn');
   const abortBtn = qs('abort-scan-btn');
@@ -1293,7 +1295,7 @@ function setScanControlButtons(s) {
   }
   if (startTranscodeBtn) {
     startTranscodeBtn.disabled = running || !!busyAction;
-    if (busyAction === 'start_transcode') {
+    if (busyAction === 'start_transcode' || busyAction === 'start_transcode_force') {
       startTranscodeBtn.textContent = '启动中...';
     } else if (running && phase === 'transcoding') {
       startTranscodeBtn.textContent = '转码进行中';
@@ -1301,6 +1303,18 @@ function setScanControlButtons(s) {
       startTranscodeBtn.textContent = '任务进行中';
     } else {
       startTranscodeBtn.textContent = '启动转码';
+    }
+  }
+  if (startTranscodeForceBtn) {
+    startTranscodeForceBtn.disabled = running || !!busyAction;
+    if (busyAction === 'start_transcode_force' || busyAction === 'start_transcode') {
+      startTranscodeForceBtn.textContent = '启动中...';
+    } else if (running && phase === 'transcoding') {
+      startTranscodeForceBtn.textContent = '转码进行中';
+    } else if (running) {
+      startTranscodeForceBtn.textContent = '任务进行中';
+    } else {
+      startTranscodeForceBtn.textContent = '强制重新转码';
     }
   }
   if (pauseBtn) {
@@ -1399,13 +1413,18 @@ async function startScan() {
   }
 }
 
-async function startTranscode() {
+async function startTranscode(force = false) {
   if (state.scanControlBusyAction) return;
-  state.scanControlBusyAction = 'start_transcode';
+  if (force) {
+    const msg = '确认强制重新转码？\n这会忽略已有缓存命中并重新编码全部匹配图片，任务会更久、CPU/磁盘压力更高。';
+    if (!confirm(msg)) return;
+  }
+  state.scanControlBusyAction = force ? 'start_transcode_force' : 'start_transcode';
   setScanControlButtons({ running: true, paused: false, pause_requested: false, abort_requested: false, phase: 'transcoding' });
   state.transcodeModalManuallyClosed = false;
   try {
     const payload = collectScanScopePayload();
+    if (force) payload.force = true;
     await api('/api/admin/albums/transcode', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1413,13 +1432,17 @@ async function startTranscode() {
     });
     await loadScanStatus();
     openTranscodeModal();
-    alert('转码任务已启动');
+    alert(force ? '强制重新转码任务已启动' : '转码任务已启动');
   } catch (e) {
-    alert(`启动转码失败: ${normalizeApiError(e.message)}`);
+    alert(`${force ? '启动强制转码失败' : '启动转码失败'}: ${normalizeApiError(e.message)}`);
   } finally {
     state.scanControlBusyAction = '';
     await loadScanStatus().catch(() => {});
   }
+}
+
+async function startTranscodeForce() {
+  await startTranscode(true);
 }
 
 function clampPct(v) {
@@ -1518,6 +1541,9 @@ async function loadScanStatus() {
   lines.push(`处理项目: ${s.processed_albums || 0}，跳过项目: ${s.skipped_albums || 0}`);
   lines.push(`扫描文件: ${s.scanned_files || 0}，更新文件: ${s.updated_files || 0}，删除文件: ${s.deleted_files || 0}`);
   lines.push(`转码进度: ${transDone}/${transTotal} (${transPct}%)，实际生成缓存对: ${s.generated_cache_pairs || 0}`);
+  if (s?.last_scan_summary?.mode === 'transcode_only' && s?.last_scan_summary?.force) {
+    lines.push('转码模式: 强制重新转码（忽略缓存命中）');
+  }
   if (s.stop_reason) lines.push(`停止原因: ${scanStopReasonText(s.stop_reason)}`);
   const summaryErr = String(s?.last_scan_summary?.error || '').trim();
   if (summaryErr) lines.push(`异常详情: ${summaryErr}`);

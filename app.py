@@ -1141,7 +1141,7 @@ def convert_image_to_webp(source_path, target_path, max_edge, quality, min_quali
         encode_webp_with_budget(img, target, quality, min_quality, target_kb, method)
 
 
-def ensure_cached_variant(rel_path, src_mtime, variant):
+def ensure_cached_variant(rel_path, src_mtime, variant, force=False):
     settings = get_runtime_settings()
     encode_cfg = get_cache_encode_settings(settings)
     src = safe_join(settings["photo_root"], rel_path)
@@ -1151,7 +1151,7 @@ def ensure_cached_variant(rel_path, src_mtime, variant):
         raise FileNotFoundError(str(src))
 
     cache_exists = cache_path.exists()
-    if cache_exists:
+    if cache_exists and not force:
         try:
             cache_stat = cache_path.stat()
             if cache_stat.st_mtime >= src_mtime:
@@ -1638,15 +1638,15 @@ def index_single_album(
     }
 
 
-def preheat_worker(task):
+def preheat_worker(task, force=False):
     photo_id, rel_path, src_mtime = task
     generated = False
     error = ""
     attempts = max(1, PREHEAT_RETRY_ATTEMPTS)
     for attempt in range(attempts):
         try:
-            _, g1 = ensure_cached_variant(rel_path, src_mtime, "thumb")
-            _, g2 = ensure_cached_variant(rel_path, src_mtime, "preview")
+            _, g1 = ensure_cached_variant(rel_path, src_mtime, "thumb", force=force)
+            _, g2 = ensure_cached_variant(rel_path, src_mtime, "preview", force=force)
             generated = g1 or g2
             error = ""
             break
@@ -2007,7 +2007,7 @@ def build_album_scope_sql(years_filter=None, album_filter=None):
     return where, params
 
 
-def run_transcode_task(trigger, years_filter=None, album_filter=None, lock_owner=None):
+def run_transcode_task(trigger, years_filter=None, album_filter=None, force=False, lock_owner=None):
     settings = get_runtime_settings()
     ensure_runtime_dirs(settings)
     workers = get_int_setting(settings, "workers", 4, 1, 16)
@@ -2044,6 +2044,7 @@ def run_transcode_task(trigger, years_filter=None, album_filter=None, lock_owner
     summary = {
         "trigger": trigger,
         "mode": "transcode_only",
+        "force": bool(force),
         "limits": {
             "workers": workers,
             "max_scan_albums_per_run": "unlimited",
@@ -2131,7 +2132,7 @@ def run_transcode_task(trigger, years_filter=None, album_filter=None, lock_owner
                     while pending_index < pending_total and len(future_to_task) < workers:
                         task = cache_tasks[pending_index]
                         pending_index += 1
-                        fut = pool.submit(preheat_worker, task)
+                        fut = pool.submit(preheat_worker, task, force)
                         future_to_task[fut] = task
 
                     if not future_to_task:
@@ -2304,7 +2305,7 @@ def start_scan(trigger="manual", years_filter=None, album_filter=None, force=Fal
         raise
 
 
-def start_transcode(trigger="manual", years_filter=None, album_filter=None):
+def start_transcode(trigger="manual", years_filter=None, album_filter=None, force=False):
     lock_owner = try_acquire_scan_lock()
     if not lock_owner:
         return False
@@ -2313,7 +2314,7 @@ def start_transcode(trigger="manual", years_filter=None, album_filter=None):
         update_scan_control_state(pause_requested=False, abort_requested=False)
         th = threading.Thread(
             target=run_transcode_task,
-            args=(trigger, years_filter, album_filter, lock_owner),
+            args=(trigger, years_filter, album_filter, force, lock_owner),
             daemon=True,
         )
         th.start()
@@ -3308,6 +3309,7 @@ def admin_transcode_albums():
 
     years_filter = normalize_years_filter(data.get("years"))
     album_filter = normalize_album_filter(data.get("album_paths"))
+    force = parse_bool(data.get("force", False))
 
     cfg = get_runtime_settings()
     _, photo_root_err, photo_root_detail = check_photo_root_access(cfg.get("photo_root"), must_be_absolute=False)
@@ -3317,7 +3319,7 @@ def admin_transcode_albums():
             payload["detail"] = photo_root_detail
         return jsonify(payload), 400
 
-    if not start_transcode(trigger="manual", years_filter=years_filter, album_filter=album_filter):
+    if not start_transcode(trigger="manual", years_filter=years_filter, album_filter=album_filter, force=force):
         return jsonify({"error": "scan_running"}), 409
 
     return jsonify({"ok": True, "status": "started"})
