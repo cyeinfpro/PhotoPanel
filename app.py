@@ -129,6 +129,12 @@ SCAN_ABORT_FORCE_SECONDS = int(os.environ.get("SCAN_ABORT_FORCE_SECONDS", "8"))
 PANEL_UPDATE_LOCK_STALE_SECONDS = int(os.environ.get("PANEL_UPDATE_LOCK_STALE_SECONDS", "7200"))
 PANEL_UPDATE_LOG_LIMIT = int(os.environ.get("PANEL_UPDATE_LOG_LIMIT", "220"))
 PANEL_UPDATE_TERMINAL_TTL_SECONDS = int(os.environ.get("PANEL_UPDATE_TERMINAL_TTL_SECONDS", "6"))
+DB_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "60"))
+DB_BUSY_TIMEOUT_MS = int(os.environ.get("DB_BUSY_TIMEOUT_MS", "120000"))
+DB_WRITE_RETRY_ATTEMPTS = int(os.environ.get("DB_WRITE_RETRY_ATTEMPTS", "8"))
+DB_WRITE_RETRY_SLEEP_SECONDS = float(os.environ.get("DB_WRITE_RETRY_SLEEP_SECONDS", "0.12"))
+PREHEAT_RETRY_ATTEMPTS = int(os.environ.get("PREHEAT_RETRY_ATTEMPTS", "2"))
+PREHEAT_RETRY_DELAY_SECONDS = float(os.environ.get("PREHEAT_RETRY_DELAY_SECONDS", "0.2"))
 
 RUNTIME_SCAN_STATUS_KEY = "scan_status_json"
 RUNTIME_SCAN_LOCK_KEY = "scan_lock_json"
@@ -205,9 +211,20 @@ def ensure_dir(path_str):
     os.makedirs(path_str, exist_ok=True)
 
 
+def is_db_lock_error(exc):
+    text = str(exc).lower()
+    return "database is locked" in text or "database is busy" in text
+
+
+def retry_sleep(attempt):
+    base = max(0.02, DB_WRITE_RETRY_SLEEP_SECONDS)
+    time.sleep(base * (attempt + 1))
+
+
 def get_db_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=max(1.0, DB_CONNECT_TIMEOUT_SECONDS))
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {max(1000, DB_BUSY_TIMEOUT_MS)}")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -217,6 +234,8 @@ def init_db():
     ensure_dir(DATA_ROOT_DEFAULT)
 
     with get_db_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -340,9 +359,16 @@ def ensure_default_admin():
 
 
 def get_setting(key, default=None):
-    with get_db_conn() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    return row["value"] if row else default
+    for attempt in range(max(1, DB_WRITE_RETRY_ATTEMPTS)):
+        try:
+            with get_db_conn() as conn:
+                row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else default
+        except sqlite3.OperationalError as exc:
+            if is_db_lock_error(exc) and attempt + 1 < max(1, DB_WRITE_RETRY_ATTEMPTS):
+                retry_sleep(attempt)
+                continue
+            raise
 
 
 def upsert_setting_conn(conn, key, value):
@@ -359,8 +385,16 @@ def upsert_setting_conn(conn, key, value):
 
 
 def set_setting(key, value):
-    with get_db_conn() as conn:
-        upsert_setting_conn(conn, key, value)
+    for attempt in range(max(1, DB_WRITE_RETRY_ATTEMPTS)):
+        try:
+            with get_db_conn() as conn:
+                upsert_setting_conn(conn, key, value)
+            break
+        except sqlite3.OperationalError as exc:
+            if is_db_lock_error(exc) and attempt + 1 < max(1, DB_WRITE_RETRY_ATTEMPTS):
+                retry_sleep(attempt)
+                continue
+            raise
     invalidate_runtime_settings_cache()
 
 
@@ -378,14 +412,29 @@ def upsert_runtime_state_conn(conn, key, value):
 
 
 def get_runtime_state(key, default=None):
-    with get_db_conn() as conn:
-        row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
-    return row["value"] if row else default
+    for attempt in range(max(1, DB_WRITE_RETRY_ATTEMPTS)):
+        try:
+            with get_db_conn() as conn:
+                row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else default
+        except sqlite3.OperationalError as exc:
+            if is_db_lock_error(exc) and attempt + 1 < max(1, DB_WRITE_RETRY_ATTEMPTS):
+                retry_sleep(attempt)
+                continue
+            raise
 
 
 def set_runtime_state(key, value):
-    with get_db_conn() as conn:
-        upsert_runtime_state_conn(conn, key, value)
+    for attempt in range(max(1, DB_WRITE_RETRY_ATTEMPTS)):
+        try:
+            with get_db_conn() as conn:
+                upsert_runtime_state_conn(conn, key, value)
+            return
+        except sqlite3.OperationalError as exc:
+            if is_db_lock_error(exc) and attempt + 1 < max(1, DB_WRITE_RETRY_ATTEMPTS):
+                retry_sleep(attempt)
+                continue
+            raise
 
 
 def parse_json_dict(raw, default):
@@ -957,6 +1006,18 @@ def cover_file_path(cache_root, album_rel_path):
     return Path(cache_root) / "cover" / f"{album_rel_path}{CACHE_EXT}"
 
 
+def is_valid_webp_cache_file(path_obj):
+    try:
+        st = path_obj.stat()
+        if st.st_size < 96:
+            return False
+        with path_obj.open("rb") as f:
+            header = f.read(12)
+        return len(header) >= 12 and header[0:4] == b"RIFF" and header[8:12] == b"WEBP"
+    except OSError:
+        return False
+
+
 def encode_webp_with_budget(image, target_path, quality, min_quality, target_kb, method):
     target_bytes = max(0, int(target_kb) * 1024)
     tmp_suffix = f".tmp.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
@@ -1017,8 +1078,15 @@ def ensure_cached_variant(rel_path, src_mtime, variant):
     cache_exists = cache_path.exists()
     if cache_exists:
         try:
-            if cache_path.stat().st_mtime >= src_mtime:
-                return str(cache_path), False
+            cache_stat = cache_path.stat()
+            if cache_stat.st_mtime >= src_mtime:
+                valid_cache = is_valid_webp_cache_file(cache_path)
+                if valid_cache:
+                    return str(cache_path), False
+                try:
+                    cache_path.unlink()
+                except OSError:
+                    pass
         except OSError:
             pass
 
@@ -1055,8 +1123,16 @@ def update_photo_cache_marker(photo_id, src_mtime, variant, conn=None):
     query = f"UPDATE photos SET {col} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
 
     if conn is None:
-        with get_db_conn() as local_conn:
-            local_conn.execute(query, (src_mtime, photo_id))
+        for attempt in range(max(1, DB_WRITE_RETRY_ATTEMPTS)):
+            try:
+                with get_db_conn() as local_conn:
+                    local_conn.execute(query, (src_mtime, photo_id))
+                return
+            except sqlite3.OperationalError as exc:
+                if is_db_lock_error(exc) and attempt + 1 < max(1, DB_WRITE_RETRY_ATTEMPTS):
+                    retry_sleep(attempt)
+                    continue
+                raise
     else:
         conn.execute(query, (src_mtime, photo_id))
 
@@ -1135,16 +1211,35 @@ def get_photo_for_user(photo_id):
 
 def set_scan_status(**kwargs):
     with scan_status_lock:
-        current = get_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, DEFAULT_SCAN_STATUS)
+        try:
+            current = get_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, DEFAULT_SCAN_STATUS)
+        except sqlite3.OperationalError as exc:
+            if is_db_lock_error(exc):
+                logger.warning("set_scan_status read locked, fallback to in-memory status")
+                current = dict(scan_status) if scan_status else dict(DEFAULT_SCAN_STATUS)
+            else:
+                raise
         current.update(kwargs)
         scan_status.clear()
         scan_status.update(current)
-        set_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, current)
+        try:
+            set_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, current)
+        except sqlite3.OperationalError as exc:
+            if is_db_lock_error(exc):
+                logger.warning("set_scan_status persist locked, keep in-memory status")
+            else:
+                raise
 
 
 def snapshot_scan_status():
     with scan_status_lock:
-        current = get_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, DEFAULT_SCAN_STATUS)
+        try:
+            current = get_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, DEFAULT_SCAN_STATUS)
+        except sqlite3.OperationalError as exc:
+            if is_db_lock_error(exc):
+                logger.warning("snapshot_scan_status read locked, fallback to in-memory status")
+                return dict(scan_status) if scan_status else dict(DEFAULT_SCAN_STATUS)
+            raise
         scan_status.clear()
         scan_status.update(current)
         return dict(scan_status)
@@ -1376,14 +1471,26 @@ def preheat_worker(task):
     photo_id, rel_path, src_mtime = task
     generated = False
     error = ""
-    try:
-        _, g1 = ensure_cached_variant(rel_path, src_mtime, "thumb")
-        _, g2 = ensure_cached_variant(rel_path, src_mtime, "preview")
-        generated = g1 or g2
-    except Exception as exc:
-        logger.warning("Preheat failed for %s: %s", rel_path, exc)
-        generated = False
-        error = str(exc)
+    attempts = max(1, PREHEAT_RETRY_ATTEMPTS)
+    for attempt in range(attempts):
+        try:
+            _, g1 = ensure_cached_variant(rel_path, src_mtime, "thumb")
+            _, g2 = ensure_cached_variant(rel_path, src_mtime, "preview")
+            generated = g1 or g2
+            error = ""
+            break
+        except FileNotFoundError as exc:
+            generated = False
+            error = str(exc)
+            break
+        except Exception as exc:
+            generated = False
+            error = str(exc)
+            if attempt + 1 >= attempts:
+                logger.warning("Preheat failed for %s (attempt %s/%s): %s", rel_path, attempt + 1, attempts, exc)
+                break
+            delay = max(0.05, PREHEAT_RETRY_DELAY_SECONDS) * (attempt + 1)
+            time.sleep(delay)
     return photo_id, rel_path, src_mtime, generated, error
 
 
@@ -1759,10 +1866,17 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                                 if generated:
                                     generated_cache_pairs += 1
                                 # whether generated or not, cache is now expected to be valid
-                                update_photo_cache_marker(photo_id, src_mtime, "thumb", conn=conn)
-                                update_photo_cache_marker(photo_id, src_mtime, "preview", conn=conn)
+                                marker_err = ""
+                                try:
+                                    update_photo_cache_marker(photo_id, src_mtime, "thumb")
+                                    update_photo_cache_marker(photo_id, src_mtime, "preview")
+                                except Exception as marker_exc:
+                                    marker_err = f"marker_update_failed: {marker_exc}"
+                                    logger.warning("Cache marker update failed for %s: %s", rel_path, marker_exc)
                                 if cache_err:
                                     recent_cache_items.append(f"[失败] {rel_path} ({cache_err})")
+                                elif marker_err:
+                                    recent_cache_items.append(f"[警告] {rel_path} ({marker_err})")
                                 elif generated:
                                     recent_cache_items.append(f"[生成] {rel_path}")
                                 else:
@@ -1770,15 +1884,12 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                                 if len(recent_cache_items) > 80:
                                     recent_cache_items = recent_cache_items[-80:]
 
-                                if completed_cache_tasks % 10 == 0 or completed_cache_tasks == len(cache_tasks):
-                                    conn.commit()
                                 set_scan_status(
                                     generated_cache_pairs=generated_cache_pairs,
                                     completed_cache_tasks=completed_cache_tasks,
                                     current_cache_file=current_cache_file,
                                     recent_cache_items=recent_cache_items,
                                 )
-                        conn.commit()
                     finally:
                         if stop_reason in {"time_budget_seconds", "aborted_by_user"} and future_to_task:
                             for fut in future_to_task:

@@ -1302,6 +1302,8 @@ async function loadScanStatus() {
   lines.push(`扫描文件: ${s.scanned_files || 0}，更新文件: ${s.updated_files || 0}，删除文件: ${s.deleted_files || 0}`);
   lines.push(`转码进度: ${transDone}/${transTotal} (${transPct}%)，实际生成缓存对: ${s.generated_cache_pairs || 0}`);
   if (s.stop_reason) lines.push(`停止原因: ${scanStopReasonText(s.stop_reason)}`);
+  const summaryErr = String(s?.last_scan_summary?.error || '').trim();
+  if (summaryErr) lines.push(`异常详情: ${summaryErr}`);
   if (s.photo_root_ok === false) {
     const detail = s.photo_root_error_detail ? ` (${s.photo_root_error_detail})` : '';
     lines.push(`PHOTO_ROOT 异常: ${normalizeApiError(s.photo_root_error)}${detail}`);
