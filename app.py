@@ -1389,7 +1389,9 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
         stop_reason = "no_album_matched" if not albums else None
 
         cache_tasks = []
+        queued_photo_ids = set()
         cache_budget = max_new_thumbs
+        manual_selected_mode = trigger == "manual" and bool(album_filter)
 
         with get_db_conn() as conn:
             for year, album_name, rel_path, album_path in albums:
@@ -1419,7 +1421,8 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                     conn, year, album_name, rel_path, dir_mtime
                 )
 
-                if not force and old_dir_mtime == dir_mtime:
+                # For manual targeted scans, do not short-circuit by album dir mtime.
+                if not force and old_dir_mtime == dir_mtime and not manual_selected_mode:
                     skipped_albums += 1
                     set_scan_status(
                         processed_albums=processed_albums,
@@ -1442,15 +1445,26 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                 updated_files += res["updated_files"]
                 deleted_files += res["deleted_files"]
 
-                if is_published and preheat_count > 0 and cache_budget > 0:
+                if preheat_count > 0 and cache_budget > 0:
                     preheat_added = 0
                     for _, photo_id, photo_rel, src_mtime, changed in res["photo_items"]:
                         if preheat_added >= preheat_count or cache_budget <= 0:
                             break
-                        if not changed:
+                        should_preheat = False
+                        if is_published and changed:
+                            should_preheat = True
+                        elif manual_selected_mode:
+                            # Admin manually selected album path(s): allow cache warmup
+                            # even when album is not published or files are unchanged.
+                            should_preheat = True
+
+                        if not should_preheat:
+                            continue
+                        if photo_id in queued_photo_ids:
                             continue
 
                         cache_tasks.append((photo_id, photo_rel, src_mtime))
+                        queued_photo_ids.add(photo_id)
                         cache_budget -= 1
                         preheat_added += 1
 
@@ -1465,7 +1479,10 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                     deleted_files=deleted_files,
                 )
 
-            # preheat changed/new published photos
+            # Preheat queue:
+            # 1) default: changed photos in published albums
+            # 2) manual targeted scan: selected albums can warm cache regardless
+            #    of publish state and change flag
             set_scan_status(total_cache_tasks=len(cache_tasks), completed_cache_tasks=0)
             if cache_tasks and time.time() - start < time_budget:
                 with ThreadPoolExecutor(max_workers=workers) as pool:
