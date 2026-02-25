@@ -129,3 +129,20 @@ export SECRET_KEY=replace_me
 
 python3 app.py
 ```
+
+## 8. 管理后台一键更新
+
+管理后台“系统设置”里提供“一键更新面板”按钮，支持：
+- 弹窗查看更新进度（步骤 + 日志）
+- 更新完成后自动刷新管理页
+
+可通过环境变量定制更新命令：
+- `PANEL_UPDATE_CMD`：更新命令（如 `git -C /opt/PhotoPanel pull --ff-only`）
+- `PANEL_RESTART_CMD`：更新后重启命令（如 `systemctl restart photopanel`）
+- `PANEL_APP_DIR`：执行命令的工作目录（默认当前项目目录）
+- `PANEL_VENV_PYTHON`：虚拟环境 python 路径（默认 `${PANEL_APP_DIR}/.venv/bin/python`）
+
+如果未设置 `PANEL_UPDATE_CMD`，系统会默认尝试：
+1. `git pull --ff-only`
+2. `pip install -r requirements.txt`
+3. 自动重启服务（优先 `systemctl`，失败则尝试给 gunicorn master 发送 `HUP`）

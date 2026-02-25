@@ -66,6 +66,10 @@ body {
   font-size: 13px;
   cursor: pointer;
 }
+.btn:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
 .btn.primary {
   border: none;
   color: #fff;
@@ -174,6 +178,48 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
 .progress-track { width: 100%; height: 8px; border-radius: 999px; background: rgba(15,23,42,.08); overflow: hidden; }
 .progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #0a84ff, #3ea4ff); transition: width .35s ease; }
 #transcode-progress-fill { background: linear-gradient(90deg, #10b981, #44d6a3); }
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: rgba(2, 8, 23, .5);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.modal-mask.show { display: flex; }
+.modal-card {
+  width: min(760px, 100%);
+  max-height: calc(100vh - 36px);
+  overflow: auto;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,.96);
+  box-shadow: 0 24px 68px rgba(15,23,42,.22);
+  padding: 14px;
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.modal-title { font-size: 15px; font-weight: 650; }
+.update-log {
+  min-height: 180px;
+  max-height: 320px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 10px;
+  border-radius: 11px;
+  border: 1px solid var(--line);
+  background: rgba(15,23,42,.04);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
 #settings-card { grid-column: span 5; }
 #scan-card { grid-column: span 7; }
 #users-card { grid-column: span 6; }
@@ -294,8 +340,9 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
         </div>
       </div>
 
-      <div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <button class="btn primary" id="save-settings-btn" onclick="saveSettings()">保存设置</button>
+        <button class="btn" id="panel-update-btn" onclick="startPanelUpdate()">一键更新面板</button>
       </div>
     </div>
   </section>
@@ -451,12 +498,32 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
   </section>
 </main>
 
+<div class="modal-mask" id="update-modal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <div class="modal-title">面板更新进度</div>
+      <button class="btn" id="update-close-btn" onclick="closeUpdateModal()">关闭</button>
+    </div>
+    <div class="muted" id="update-stage-text">等待开始...</div>
+    <div style="height:8px"></div>
+    <div class="progress-track">
+      <div class="progress-fill" id="update-progress-fill"></div>
+    </div>
+    <div style="height:6px"></div>
+    <div class="muted" id="update-progress-text">0%</div>
+    <pre class="update-log" id="update-log">暂无日志</pre>
+  </div>
+</div>
+
 <script>
 const state = {
   users: [],
   albums: [],
   selectedAlbumId: null,
   selectedAlbumName: '',
+  updatePollTimer: null,
+  updateReloadTimer: null,
+  updateReloadScheduled: false,
 };
 
 function qs(id) { return document.getElementById(id); }
@@ -480,6 +547,7 @@ function normalizeApiError(message) {
     cache_root_not_writable: '缓存目录不可写',
     cache_root_prepare_failed: '缓存目录初始化失败',
     scan_running: '已有扫描任务在运行',
+    panel_update_running: '已有更新任务在运行',
   };
   const readable = map[code] || code;
   return detail ? `${readable}: ${detail}` : readable;
@@ -502,6 +570,30 @@ async function api(path, options = {}) {
   }
   const ct = res.headers.get('content-type') || '';
   return ct.includes('application/json') ? res.json() : null;
+}
+
+function scanMessageText(code) {
+  const map = {
+    idle: '空闲',
+    running: '运行中',
+    completed: '完成',
+    completed_with_limit: '完成（达到限额）',
+    completed_no_match: '完成（无匹配项目）',
+    completed_with_notice: '完成（有提示）',
+    failed: '失败',
+  };
+  return map[String(code || '')] || String(code || 'unknown');
+}
+
+function scanStopReasonText(code) {
+  const map = {
+    no_album_matched: '没有匹配到任何项目（检查年份/项目路径筛选）',
+    max_scan_albums_per_run: '触发项目数量上限',
+    time_budget_seconds: '触发时间上限',
+    exception: '扫描异常',
+    stale_scan_lock_recovered: '检测到旧扫描任务异常中断，已自动恢复',
+  };
+  return map[String(code || '')] || String(code || '-');
 }
 
 async function logout() {
@@ -555,6 +647,119 @@ async function saveSettings() {
     alert('设置已保存');
   } catch (e) {
     alert(`保存失败: ${normalizeApiError(e.message)}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function openUpdateModal() {
+  qs('update-modal').classList.add('show');
+}
+
+function stopUpdatePolling() {
+  if (state.updatePollTimer) {
+    clearInterval(state.updatePollTimer);
+    state.updatePollTimer = null;
+  }
+}
+
+function closeUpdateModal() {
+  const running = (qs('update-close-btn').dataset.running || '') === '1';
+  if (running) return;
+  stopUpdatePolling();
+  qs('update-modal').classList.remove('show');
+}
+
+function renderPanelUpdateStatus(s) {
+  const running = !!s.running;
+  qs('update-close-btn').dataset.running = running ? '1' : '0';
+  qs('update-close-btn').disabled = running;
+  if (qs('panel-update-btn')) qs('panel-update-btn').disabled = running;
+
+  const stage = String(s.stage || '-');
+  const stepName = String(s.current_step || '-');
+  const pct = clampPct(s.progress_pct || 0);
+  const done = Number(s.steps_done || 0);
+  const total = Number(s.steps_total || 0);
+  const message = String(s.message || 'unknown');
+  const messageText = message === 'failed' ? '失败' : (message === 'completed' ? '完成' : '进行中');
+
+  qs('update-stage-text').textContent = `状态: ${messageText} · 阶段: ${stage} · 当前: ${stepName}`;
+  qs('update-progress-fill').style.width = `${pct}%`;
+  qs('update-progress-text').textContent = `${pct}% · 步骤 ${done}/${total || '?'}`;
+
+  const logEl = qs('update-log');
+  const logs = Array.isArray(s.logs) && s.logs.length ? s.logs.join('\n') : '暂无日志';
+  const nearBottom = (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 36;
+  logEl.textContent = logs;
+  if (nearBottom) logEl.scrollTop = logEl.scrollHeight;
+
+  if (!running) {
+    stopUpdatePolling();
+    if (message === 'completed' && !state.updateReloadScheduled) {
+      state.updateReloadScheduled = true;
+      qs('update-stage-text').textContent = '更新完成，正在刷新面板...';
+      state.updateReloadTimer = setTimeout(() => {
+        window.location.reload();
+      }, 1800);
+    } else if (message === 'failed') {
+      const err = s.error ? `，错误: ${s.error}` : '';
+      qs('update-stage-text').textContent = `更新失败${err}`;
+    }
+  }
+}
+
+async function loadPanelUpdateStatus() {
+  const s = await api('/api/admin/panel-update/status');
+  renderPanelUpdateStatus(s);
+  return s;
+}
+
+function startUpdatePolling() {
+  stopUpdatePolling();
+  state.updatePollTimer = setInterval(() => {
+    loadPanelUpdateStatus().catch(() => {
+      qs('update-stage-text').textContent = '连接中断，等待服务恢复...';
+    });
+  }, 1200);
+}
+
+async function startPanelUpdate() {
+  if (!confirm('确认执行“一键更新面板”？更新期间会短暂不可用。')) return;
+
+  const btn = qs('panel-update-btn');
+  if (btn) btn.disabled = true;
+  if (state.updateReloadTimer) {
+    clearTimeout(state.updateReloadTimer);
+    state.updateReloadTimer = null;
+  }
+  state.updateReloadScheduled = false;
+
+  openUpdateModal();
+  qs('update-stage-text').textContent = '正在启动更新任务...';
+  qs('update-progress-fill').style.width = '2%';
+  qs('update-progress-text').textContent = '2%';
+  qs('update-log').textContent = '任务准备中...';
+
+  try {
+    await api('/api/admin/panel-update/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    await loadPanelUpdateStatus();
+    startUpdatePolling();
+  } catch (e) {
+    const msg = normalizeApiError(e.message);
+    if (String(e.message || '').includes('panel_update_running')) {
+      qs('update-stage-text').textContent = '检测到已有更新任务，正在同步进度...';
+      await loadPanelUpdateStatus().catch(() => {});
+      startUpdatePolling();
+    } else {
+      qs('update-stage-text').textContent = `更新启动失败: ${msg}`;
+      qs('update-close-btn').disabled = false;
+      qs('update-close-btn').dataset.running = '0';
+    }
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -825,14 +1030,19 @@ async function loadScanStatus() {
   setProgress('transcode-progress-fill', 'transcode-progress-text', transDone, transTotal, transPct);
 
   const lines = [];
-  lines.push(`状态: ${s.message || 'unknown'}${s.running ? ' (running)' : ''}`);
+  lines.push(`状态: ${scanMessageText(s.message || 'unknown')}${s.running ? ' (running)' : ''}`);
+  if (s.scan_lock_running && !s.running) lines.push('提示: 扫描锁仍占用，系统会自动释放过期锁');
   lines.push(`开始: ${s.started_at ? new Date(s.started_at * 1000).toLocaleString() : '-'}`);
   lines.push(`结束: ${s.finished_at ? new Date(s.finished_at * 1000).toLocaleString() : '-'}`);
   lines.push(`项目进度: ${scanDone}/${scanTotal} (${scanPct}%)`);
   lines.push(`处理项目: ${s.processed_albums || 0}，跳过项目: ${s.skipped_albums || 0}`);
   lines.push(`扫描文件: ${s.scanned_files || 0}，更新文件: ${s.updated_files || 0}，删除文件: ${s.deleted_files || 0}`);
   lines.push(`转码进度: ${transDone}/${transTotal} (${transPct}%)，实际生成缓存对: ${s.generated_cache_pairs || 0}`);
-  if (s.stop_reason) lines.push(`停止原因: ${s.stop_reason}`);
+  if (s.stop_reason) lines.push(`停止原因: ${scanStopReasonText(s.stop_reason)}`);
+  if (s.photo_root_ok === false) {
+    const detail = s.photo_root_error_detail ? ` (${s.photo_root_error_detail})` : '';
+    lines.push(`PHOTO_ROOT 异常: ${normalizeApiError(s.photo_root_error)}${detail}`);
+  }
   if (s.last_scan_summary && Object.keys(s.last_scan_summary).length) {
     lines.push('最近任务摘要:');
     lines.push(JSON.stringify(s.last_scan_summary, null, 2));
@@ -856,6 +1066,15 @@ async function init() {
   } catch (e) {
     alert(`初始化失败: ${e.message}`);
   }
+
+  try {
+    const updateStatus = await api('/api/admin/panel-update/status');
+    if (updateStatus.running || updateStatus.message === 'failed' || updateStatus.message === 'completed') {
+      openUpdateModal();
+      renderPanelUpdateStatus(updateStatus);
+      if (updateStatus.running) startUpdatePolling();
+    }
+  } catch (_e) {}
 
   setInterval(() => {
     loadScanStatus().catch(() => {});

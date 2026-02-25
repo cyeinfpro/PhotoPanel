@@ -9,9 +9,14 @@ PhotoNest
 import json
 import logging
 import os
+import shlex
+import shutil
+import signal
 import sqlite3
+import subprocess
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from pathlib import Path
@@ -111,14 +116,22 @@ app = Flask(__name__)
 app.secret_key = SECRET_KEY
 app.config["JSON_AS_ASCII"] = False
 
-scan_lock = threading.Lock()
 scan_status_lock = threading.Lock()
+update_status_lock = threading.Lock()
 runtime_settings_lock = threading.Lock()
 runtime_settings_cache = None
 runtime_settings_cache_expires_at = 0.0
 RUNTIME_SETTINGS_CACHE_TTL = float(os.environ.get("SETTINGS_CACHE_TTL_SECONDS", "5"))
+SCAN_LOCK_STALE_SECONDS = int(os.environ.get("SCAN_LOCK_STALE_SECONDS", "21600"))
+PANEL_UPDATE_LOCK_STALE_SECONDS = int(os.environ.get("PANEL_UPDATE_LOCK_STALE_SECONDS", "7200"))
+PANEL_UPDATE_LOG_LIMIT = int(os.environ.get("PANEL_UPDATE_LOG_LIMIT", "220"))
 
-scan_status = {
+RUNTIME_SCAN_STATUS_KEY = "scan_status_json"
+RUNTIME_SCAN_LOCK_KEY = "scan_lock_json"
+RUNTIME_UPDATE_STATUS_KEY = "panel_update_status_json"
+RUNTIME_UPDATE_LOCK_KEY = "panel_update_lock_json"
+
+DEFAULT_SCAN_STATUS = {
     "running": False,
     "started_at": None,
     "finished_at": None,
@@ -138,6 +151,33 @@ scan_status = {
     "stop_reason": None,
     "summary": {},
 }
+
+DEFAULT_UPDATE_STATUS = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "message": "idle",
+    "stage": "idle",
+    "progress_pct": 0,
+    "steps_total": 0,
+    "steps_done": 0,
+    "current_step": "",
+    "logs": [],
+    "error": "",
+    "needs_reload": False,
+    "updated_at": None,
+}
+
+DEFAULT_LOCK_STATE = {
+    "running": False,
+    "owner": "",
+    "started_at": None,
+    "heartbeat_at": None,
+    "finished_at": None,
+}
+
+scan_status = dict(DEFAULT_SCAN_STATUS)
+panel_update_status = dict(DEFAULT_UPDATE_STATUS)
 
 # ---------------------------------------------------------------------------
 # DB / settings helpers
@@ -173,6 +213,12 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS runtime_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -230,6 +276,22 @@ def init_db():
                 "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
                 (key, value),
             )
+        conn.execute(
+            "INSERT OR IGNORE INTO runtime_state(key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (RUNTIME_SCAN_STATUS_KEY, json.dumps(DEFAULT_SCAN_STATUS, ensure_ascii=False)),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO runtime_state(key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (RUNTIME_SCAN_LOCK_KEY, json.dumps(DEFAULT_LOCK_STATE, ensure_ascii=False)),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO runtime_state(key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (RUNTIME_UPDATE_STATUS_KEY, json.dumps(DEFAULT_UPDATE_STATUS, ensure_ascii=False)),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO runtime_state(key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (RUNTIME_UPDATE_LOCK_KEY, json.dumps(DEFAULT_LOCK_STATE, ensure_ascii=False)),
+        )
 
     ensure_default_admin()
     ensure_runtime_dirs()
@@ -262,19 +324,197 @@ def get_setting(key, default=None):
     return row["value"] if row else default
 
 
+def upsert_setting_conn(conn, key, value):
+    conn.execute(
+        """
+        INSERT INTO settings(key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (key, str(value)),
+    )
+
+
 def set_setting(key, value):
     with get_db_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO settings(key, value, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (key, str(value)),
-        )
+        upsert_setting_conn(conn, key, value)
     invalidate_runtime_settings_cache()
+
+
+def upsert_runtime_state_conn(conn, key, value):
+    conn.execute(
+        """
+        INSERT INTO runtime_state(key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (key, str(value)),
+    )
+
+
+def get_runtime_state(key, default=None):
+    with get_db_conn() as conn:
+        row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_runtime_state(key, value):
+    with get_db_conn() as conn:
+        upsert_runtime_state_conn(conn, key, value)
+
+
+def parse_json_dict(raw, default):
+    if raw is None:
+        return dict(default)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return dict(default)
+    if not isinstance(data, dict):
+        return dict(default)
+
+    merged = dict(default)
+    merged.update(data)
+    return merged
+
+
+def get_json_runtime_state(key, default):
+    raw = get_runtime_state(key)
+    return parse_json_dict(raw, default)
+
+
+def set_json_runtime_state(key, value):
+    set_runtime_state(key, json.dumps(value, ensure_ascii=False))
+
+
+def now_ts():
+    return int(time.time())
+
+
+def _acquire_runtime_lock(lock_key, stale_seconds):
+    owner = f"{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:10]}"
+    now = now_ts()
+    with get_db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (lock_key,)).fetchone()
+        lock_data = parse_json_dict(row["value"], DEFAULT_LOCK_STATE) if row else dict(DEFAULT_LOCK_STATE)
+        running = bool(lock_data.get("running"))
+        heartbeat_at = int(lock_data.get("heartbeat_at") or lock_data.get("started_at") or 0)
+        stale = running and heartbeat_at > 0 and (now - heartbeat_at) > stale_seconds
+
+        if running and not stale:
+            return None
+
+        next_lock = {
+            "running": True,
+            "owner": owner,
+            "started_at": now,
+            "heartbeat_at": now,
+            "finished_at": None,
+        }
+        upsert_runtime_state_conn(conn, lock_key, json.dumps(next_lock, ensure_ascii=False))
+        conn.commit()
+    return owner
+
+
+def _touch_runtime_lock(lock_key, owner):
+    now = now_ts()
+    with get_db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (lock_key,)).fetchone()
+        lock_data = parse_json_dict(row["value"], DEFAULT_LOCK_STATE) if row else dict(DEFAULT_LOCK_STATE)
+        current_owner = str(lock_data.get("owner") or "")
+        if not lock_data.get("running") or (current_owner and owner and current_owner != owner):
+            return False
+        lock_data["heartbeat_at"] = now
+        upsert_runtime_state_conn(conn, lock_key, json.dumps(lock_data, ensure_ascii=False))
+        conn.commit()
+    return True
+
+
+def _release_runtime_lock(lock_key, owner):
+    now = now_ts()
+    with get_db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (lock_key,)).fetchone()
+        lock_data = parse_json_dict(row["value"], DEFAULT_LOCK_STATE) if row else dict(DEFAULT_LOCK_STATE)
+        current_owner = str(lock_data.get("owner") or "")
+        if current_owner and owner and current_owner != owner:
+            return False
+
+        lock_data.update(
+            {
+                "running": False,
+                "owner": "",
+                "heartbeat_at": now,
+                "finished_at": now,
+            }
+        )
+        upsert_runtime_state_conn(conn, lock_key, json.dumps(lock_data, ensure_ascii=False))
+        conn.commit()
+    return True
+
+
+def reconcile_runtime_states():
+    now = now_ts()
+
+    scan_lock = get_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, DEFAULT_LOCK_STATE)
+    scan_hb = int(scan_lock.get("heartbeat_at") or scan_lock.get("started_at") or 0)
+    if scan_lock.get("running") and scan_hb > 0 and (now - scan_hb) > SCAN_LOCK_STALE_SECONDS:
+        scan_lock.update(
+            {
+                "running": False,
+                "owner": "",
+                "heartbeat_at": now,
+                "finished_at": now,
+            }
+        )
+        set_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, scan_lock)
+
+        stale_scan = get_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, DEFAULT_SCAN_STATUS)
+        if stale_scan.get("running"):
+            stale_scan.update(
+                {
+                    "running": False,
+                    "finished_at": now,
+                    "message": "failed",
+                    "stop_reason": "stale_scan_lock_recovered",
+                }
+            )
+            set_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, stale_scan)
+
+    update_lock = get_json_runtime_state(RUNTIME_UPDATE_LOCK_KEY, DEFAULT_LOCK_STATE)
+    update_hb = int(update_lock.get("heartbeat_at") or update_lock.get("started_at") or 0)
+    if update_lock.get("running") and update_hb > 0 and (now - update_hb) > PANEL_UPDATE_LOCK_STALE_SECONDS:
+        update_lock.update(
+            {
+                "running": False,
+                "owner": "",
+                "heartbeat_at": now,
+                "finished_at": now,
+            }
+        )
+        set_json_runtime_state(RUNTIME_UPDATE_LOCK_KEY, update_lock)
+
+        stale_update = get_json_runtime_state(RUNTIME_UPDATE_STATUS_KEY, DEFAULT_UPDATE_STATUS)
+        if stale_update.get("running"):
+            logs = list(stale_update.get("logs") or [])
+            logs.append("检测到旧更新任务锁超时，已自动恢复为失败状态")
+            stale_update.update(
+                {
+                    "running": False,
+                    "finished_at": now,
+                    "message": "failed",
+                    "stage": "failed",
+                    "error": "stale_update_lock_recovered",
+                    "logs": logs[-PANEL_UPDATE_LOG_LIMIT:],
+                }
+            )
+            set_json_runtime_state(RUNTIME_UPDATE_STATUS_KEY, stale_update)
 
 
 def invalidate_runtime_settings_cache():
@@ -430,6 +670,84 @@ def normalize_album_filter(raw_album_paths):
         if rel:
             values.add(rel)
     return values or None
+
+
+def _probe_dir_readable(path_obj):
+    try:
+        with os.scandir(path_obj) as it:
+            next(it, None)
+    except PermissionError as exc:
+        return False, str(exc)
+    except OSError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def _probe_dir_writable(path_obj):
+    probe_dir = path_obj / f".photopanel_probe_{uuid.uuid4().hex[:10]}"
+    probe_file = probe_dir / "probe.txt"
+    try:
+        probe_dir.mkdir(parents=False, exist_ok=False)
+        with open(probe_file, "w", encoding="utf-8") as f:
+            f.write("ok")
+        with open(probe_file, "r", encoding="utf-8") as f:
+            _ = f.read(2)
+    except OSError as exc:
+        return False, str(exc)
+    finally:
+        try:
+            if probe_file.exists():
+                probe_file.unlink()
+        except OSError:
+            pass
+        try:
+            if probe_dir.exists():
+                probe_dir.rmdir()
+        except OSError:
+            pass
+    return True, ""
+
+
+def check_photo_root_access(raw_path, must_be_absolute=True):
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return None, "photo_root_empty", ""
+
+    path_obj = Path(raw).expanduser()
+    if must_be_absolute and not path_obj.is_absolute():
+        return None, "photo_root_must_be_absolute", ""
+    if not path_obj.exists():
+        return None, "photo_root_not_found", ""
+    if not path_obj.is_dir():
+        return None, "photo_root_not_directory", ""
+
+    readable, detail = _probe_dir_readable(path_obj)
+    if not readable:
+        return None, "photo_root_not_readable", detail
+    return path_obj, "", ""
+
+
+def check_cache_root_access(raw_path, must_be_absolute=True):
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return None, "cache_root_empty", ""
+
+    path_obj = Path(raw).expanduser()
+    if must_be_absolute and not path_obj.is_absolute():
+        return None, "cache_root_must_be_absolute", ""
+
+    try:
+        ensure_dir(str(path_obj))
+    except OSError as exc:
+        return None, "cache_root_create_failed", str(exc)
+
+    if not path_obj.is_dir():
+        return None, "cache_root_not_directory", ""
+
+    writable, detail = _probe_dir_writable(path_obj)
+    if not writable:
+        return None, "cache_root_not_writable", detail
+    return path_obj, "", ""
 
 
 def login_required(fn):
@@ -692,12 +1010,31 @@ def get_photo_for_user(photo_id):
 
 def set_scan_status(**kwargs):
     with scan_status_lock:
-        scan_status.update(kwargs)
+        current = get_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, DEFAULT_SCAN_STATUS)
+        current.update(kwargs)
+        scan_status.clear()
+        scan_status.update(current)
+        set_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, current)
 
 
 def snapshot_scan_status():
     with scan_status_lock:
+        current = get_json_runtime_state(RUNTIME_SCAN_STATUS_KEY, DEFAULT_SCAN_STATUS)
+        scan_status.clear()
+        scan_status.update(current)
         return dict(scan_status)
+
+
+def try_acquire_scan_lock():
+    return _acquire_runtime_lock(RUNTIME_SCAN_LOCK_KEY, SCAN_LOCK_STALE_SECONDS)
+
+
+def touch_scan_lock(owner):
+    return _touch_runtime_lock(RUNTIME_SCAN_LOCK_KEY, owner)
+
+
+def release_scan_lock(owner):
+    return _release_runtime_lock(RUNTIME_SCAN_LOCK_KEY, owner)
 
 
 def discover_albums(photo_root, years_filter=None, album_filter=None, exclude_dirs=None):
@@ -880,7 +1217,7 @@ def preheat_worker(task):
     return photo_id, src_mtime, generated
 
 
-def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
+def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lock_owner=None):
     settings = get_runtime_settings()
     ensure_runtime_dirs(settings)
 
@@ -957,6 +1294,8 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
 
         with get_db_conn() as conn:
             for year, album_name, rel_path, album_path in albums:
+                if lock_owner:
+                    touch_scan_lock(lock_owner)
                 if visited_albums >= max_scan_albums:
                     stop_reason = "max_scan_albums_per_run"
                     break
@@ -1033,6 +1372,8 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     futures = [pool.submit(preheat_worker, t) for t in cache_tasks]
                     for fut in as_completed(futures):
+                        if lock_owner and completed_cache_tasks % 8 == 0:
+                            touch_scan_lock(lock_owner)
                         if time.time() - start >= time_budget:
                             stop_reason = stop_reason or "time_budget_seconds"
                             break
@@ -1045,6 +1386,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
                         update_photo_cache_marker(photo_id, src_mtime, "preview", conn=conn)
 
                         if completed_cache_tasks % 10 == 0 or completed_cache_tasks == len(cache_tasks):
+                            conn.commit()
                             set_scan_status(
                                 generated_cache_pairs=generated_cache_pairs,
                                 completed_cache_tasks=completed_cache_tasks,
@@ -1111,20 +1453,289 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False):
             stop_reason="exception",
             summary=summary,
         )
+    finally:
+        if lock_owner:
+            release_scan_lock(lock_owner)
 
 
 def start_scan(trigger="manual", years_filter=None, album_filter=None, force=False):
-    with scan_lock:
-        if snapshot_scan_status().get("running"):
-            return False
+    lock_owner = try_acquire_scan_lock()
+    if not lock_owner:
+        return False
 
+    try:
         th = threading.Thread(
             target=run_scan_task,
-            args=(trigger, years_filter, album_filter, force),
+            args=(trigger, years_filter, album_filter, force, lock_owner),
             daemon=True,
         )
         th.start()
         return True
+    except Exception:
+        release_scan_lock(lock_owner)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Panel update runtime
+# ---------------------------------------------------------------------------
+
+
+def snapshot_panel_update_status():
+    with update_status_lock:
+        current = get_json_runtime_state(RUNTIME_UPDATE_STATUS_KEY, DEFAULT_UPDATE_STATUS)
+        panel_update_status.clear()
+        panel_update_status.update(current)
+        return dict(panel_update_status)
+
+
+def set_panel_update_status(**kwargs):
+    with update_status_lock:
+        current = get_json_runtime_state(RUNTIME_UPDATE_STATUS_KEY, DEFAULT_UPDATE_STATUS)
+        current.update(kwargs)
+        current["updated_at"] = now_ts()
+        panel_update_status.clear()
+        panel_update_status.update(current)
+        set_json_runtime_state(RUNTIME_UPDATE_STATUS_KEY, current)
+
+
+def append_panel_update_log(line):
+    if line is None:
+        return
+    text = str(line).rstrip()
+    if not text:
+        return
+    with update_status_lock:
+        current = get_json_runtime_state(RUNTIME_UPDATE_STATUS_KEY, DEFAULT_UPDATE_STATUS)
+        logs = list(current.get("logs") or [])
+        logs.append(text)
+        if len(logs) > PANEL_UPDATE_LOG_LIMIT:
+            logs = logs[-PANEL_UPDATE_LOG_LIMIT:]
+        current["logs"] = logs
+        current["updated_at"] = now_ts()
+        panel_update_status.clear()
+        panel_update_status.update(current)
+        set_json_runtime_state(RUNTIME_UPDATE_STATUS_KEY, current)
+
+
+def try_acquire_panel_update_lock():
+    return _acquire_runtime_lock(RUNTIME_UPDATE_LOCK_KEY, PANEL_UPDATE_LOCK_STALE_SECONDS)
+
+
+def touch_panel_update_lock(owner):
+    return _touch_runtime_lock(RUNTIME_UPDATE_LOCK_KEY, owner)
+
+
+def release_panel_update_lock(owner):
+    return _release_runtime_lock(RUNTIME_UPDATE_LOCK_KEY, owner)
+
+
+def run_bash_command(command, cwd):
+    proc = subprocess.Popen(
+        ["/bin/bash", "-lc", command],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        if proc.stdout:
+            for line in proc.stdout:
+                append_panel_update_log(line.rstrip("\n"))
+        proc.wait()
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+    return proc.returncode
+
+
+def read_process_cmdline(pid):
+    proc_file = Path(f"/proc/{pid}/cmdline")
+    if proc_file.exists():
+        try:
+            raw = proc_file.read_bytes()
+            return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+        except OSError:
+            pass
+    try:
+        out = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
+        return out.strip()
+    except Exception:
+        return ""
+
+
+def build_panel_update_steps():
+    app_dir = Path(os.environ.get("PANEL_APP_DIR", str(Path(__file__).resolve().parent))).resolve()
+    custom_update_cmd = os.environ.get("PANEL_UPDATE_CMD", "").strip()
+    steps = []
+
+    if custom_update_cmd:
+        steps.append(("执行自定义更新命令", custom_update_cmd))
+    else:
+        git_dir = app_dir / ".git"
+        if git_dir.exists():
+            steps.append(("拉取最新代码", f"git -C {shlex.quote(str(app_dir))} pull --ff-only"))
+
+        requirements_file = app_dir / "requirements.txt"
+        custom_venv_python = os.environ.get("PANEL_VENV_PYTHON", "").strip()
+        if custom_venv_python:
+            venv_python = Path(custom_venv_python).expanduser()
+        else:
+            venv_python = app_dir / ".venv" / "bin" / "python"
+
+        if requirements_file.exists():
+            if venv_python.exists():
+                steps.append(
+                    (
+                        "安装/更新 Python 依赖",
+                        f"{shlex.quote(str(venv_python))} -m pip install -r {shlex.quote(str(requirements_file))}",
+                    )
+                )
+            else:
+                steps.append(
+                    (
+                        "安装/更新 Python 依赖",
+                        f"python3 -m pip install -r {shlex.quote(str(requirements_file))}",
+                    )
+                )
+
+    return app_dir, steps
+
+
+def try_reload_panel(app_dir):
+    custom_restart_cmd = os.environ.get("PANEL_RESTART_CMD", "").strip()
+    if custom_restart_cmd:
+        append_panel_update_log(f"$ {custom_restart_cmd}")
+        code = run_bash_command(custom_restart_cmd, app_dir)
+        if code == 0:
+            return True, "自定义重启命令执行成功"
+        return False, f"自定义重启命令失败，退出码 {code}"
+
+    service_name = os.environ.get("PANEL_SERVICE_NAME", "photopanel").strip() or "photopanel"
+    if shutil.which("systemctl"):
+        restart_cmd = f"systemctl restart {shlex.quote(service_name)}"
+        append_panel_update_log(f"$ {restart_cmd}")
+        code = run_bash_command(restart_cmd, app_dir)
+        if code == 0:
+            return True, f"systemctl 已重启服务: {service_name}"
+        append_panel_update_log(f"systemctl 重启失败，退出码 {code}，尝试 gunicorn HUP")
+
+    parent_pid = os.getppid()
+    parent_cmd = read_process_cmdline(parent_pid).lower()
+    if "gunicorn" in parent_cmd:
+        try:
+            os.kill(parent_pid, signal.SIGHUP)
+            return True, f"已向 gunicorn master({parent_pid}) 发送 HUP"
+        except OSError as exc:
+            return False, f"向 gunicorn master 发送 HUP 失败: {exc}"
+
+    return False, "无法自动重启面板进程，请配置 PANEL_RESTART_CMD"
+
+
+def run_panel_update_task(trigger, lock_owner):
+    started = now_ts()
+    set_panel_update_status(
+        running=True,
+        started_at=started,
+        finished_at=None,
+        message="running",
+        stage="prepare",
+        progress_pct=2,
+        steps_total=0,
+        steps_done=0,
+        current_step="准备更新任务",
+        logs=[],
+        error="",
+        needs_reload=False,
+    )
+    append_panel_update_log(f"开始更新任务（trigger={trigger}）")
+
+    try:
+        app_dir, steps = build_panel_update_steps()
+        if not steps:
+            raise RuntimeError("没有可执行的更新步骤，请检查仓库和更新命令配置")
+
+        total_steps = len(steps) + 1
+        set_panel_update_status(steps_total=total_steps, steps_done=0, progress_pct=5)
+
+        done = 0
+        for name, cmd in steps:
+            touch_panel_update_lock(lock_owner)
+            done += 1
+            set_panel_update_status(
+                stage="running",
+                current_step=name,
+                steps_done=done - 1,
+                progress_pct=min(90, int(((done - 1) / total_steps) * 100)),
+            )
+            append_panel_update_log(f"[{done}/{total_steps}] {name}")
+            append_panel_update_log(f"$ {cmd}")
+            rc = run_bash_command(cmd, app_dir)
+            if rc != 0:
+                raise RuntimeError(f"{name}失败，退出码 {rc}")
+
+            touch_panel_update_lock(lock_owner)
+            set_panel_update_status(
+                steps_done=done,
+                progress_pct=min(92, int((done / total_steps) * 100)),
+            )
+
+        done += 1
+        touch_panel_update_lock(lock_owner)
+        set_panel_update_status(
+            stage="reloading",
+            current_step="重载面板进程",
+            steps_done=done - 1,
+            progress_pct=95,
+            needs_reload=True,
+        )
+        append_panel_update_log(f"[{done}/{total_steps}] 重载面板进程")
+        ok, msg = try_reload_panel(app_dir)
+        append_panel_update_log(msg)
+        if not ok:
+            raise RuntimeError(msg)
+
+        set_panel_update_status(
+            running=False,
+            finished_at=now_ts(),
+            message="completed",
+            stage="completed",
+            current_step="更新完成",
+            steps_done=total_steps,
+            progress_pct=100,
+            needs_reload=True,
+        )
+    except Exception as exc:
+        append_panel_update_log(f"更新失败: {exc}")
+        set_panel_update_status(
+            running=False,
+            finished_at=now_ts(),
+            message="failed",
+            stage="failed",
+            error=str(exc),
+            current_step="更新失败",
+        )
+    finally:
+        release_panel_update_lock(lock_owner)
+
+
+def start_panel_update(trigger="manual"):
+    lock_owner = try_acquire_panel_update_lock()
+    if not lock_owner:
+        return False
+
+    try:
+        th = threading.Thread(
+            target=run_panel_update_task,
+            args=(trigger, lock_owner),
+            daemon=True,
+        )
+        th.start()
+        return True
+    except Exception:
+        release_panel_update_lock(lock_owner)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1587,6 +2198,7 @@ def api_download(photo_id):
 @admin_required
 def admin_scan_status():
     status = snapshot_scan_status()
+    lock_state = get_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, DEFAULT_LOCK_STATE)
 
     raw = get_setting("last_scan_summary", "")
     if raw:
@@ -1615,6 +2227,17 @@ def admin_scan_status():
     status["scan_progress_pct"] = scan_progress_pct
     status["transcode_done_tasks"] = trans_done
     status["transcode_progress_pct"] = transcode_progress_pct
+    status["scan_lock_running"] = bool(lock_state.get("running"))
+
+    cfg = get_runtime_settings()
+    photo_root = cfg.get("photo_root", "")
+    _, photo_root_err, photo_root_detail = check_photo_root_access(photo_root, must_be_absolute=False)
+    status["photo_root"] = photo_root
+    status["photo_root_ok"] = photo_root_err == ""
+    if photo_root_err:
+        status["photo_root_error"] = photo_root_err
+        if photo_root_detail:
+            status["photo_root_error_detail"] = photo_root_detail
 
     return jsonify(status)
 
@@ -1628,19 +2251,32 @@ def admin_scan_albums():
     album_filter = normalize_album_filter(data.get("album_paths"))
 
     cfg = get_runtime_settings()
-    photo_root = Path(cfg["photo_root"]).expanduser()
-    if not photo_root.exists():
-        return jsonify({"error": "photo_root_not_found"}), 400
-    if not photo_root.is_dir():
-        return jsonify({"error": "photo_root_not_directory"}), 400
-    if not os.access(str(photo_root), os.R_OK | os.X_OK):
-        return jsonify({"error": "photo_root_not_readable"}), 400
+    _, photo_root_err, photo_root_detail = check_photo_root_access(cfg.get("photo_root"), must_be_absolute=False)
+    if photo_root_err:
+        payload = {"error": photo_root_err}
+        if photo_root_detail:
+            payload["detail"] = photo_root_detail
+        return jsonify(payload), 400
 
     force = parse_bool(data.get("force", False))
 
     if not start_scan(trigger="manual", years_filter=years_filter, album_filter=album_filter, force=force):
         return jsonify({"error": "scan_running"}), 409
 
+    return jsonify({"ok": True, "status": "started"})
+
+
+@app.route("/api/admin/panel-update/status")
+@admin_required
+def admin_panel_update_status():
+    return jsonify(snapshot_panel_update_status())
+
+
+@app.route("/api/admin/panel-update/start", methods=["POST"])
+@admin_required
+def admin_panel_update_start():
+    if not start_panel_update(trigger="manual"):
+        return jsonify({"error": "panel_update_running"}), 409
     return jsonify({"ok": True, "status": "started"})
 
 
@@ -1687,35 +2323,21 @@ def admin_settings():
     data = request.get_json(silent=True) or {}
 
     if "photo_root" in data:
-        raw = str(data["photo_root"]).strip()
-        if not raw:
-            return jsonify({"error": "photo_root_empty"}), 400
-        p = Path(raw).expanduser()
-        if not p.is_absolute():
-            return jsonify({"error": "photo_root_must_be_absolute"}), 400
-        if not p.exists():
-            return jsonify({"error": "photo_root_not_found"}), 400
-        if not p.is_dir():
-            return jsonify({"error": "photo_root_not_directory"}), 400
-        if not os.access(str(p), os.R_OK | os.X_OK):
-            return jsonify({"error": "photo_root_not_readable"}), 400
+        p, err, detail = check_photo_root_access(data["photo_root"], must_be_absolute=True)
+        if err:
+            payload = {"error": err}
+            if detail:
+                payload["detail"] = detail
+            return jsonify(payload), 400
         set_setting("photo_root", str(p))
 
     if "cache_root" in data:
-        raw = str(data["cache_root"]).strip()
-        if not raw:
-            return jsonify({"error": "cache_root_empty"}), 400
-        p = Path(raw).expanduser()
-        if not p.is_absolute():
-            return jsonify({"error": "cache_root_must_be_absolute"}), 400
-        try:
-            ensure_dir(str(p))
-        except OSError as exc:
-            return jsonify({"error": "cache_root_create_failed", "detail": str(exc)}), 400
-        if not p.is_dir():
-            return jsonify({"error": "cache_root_not_directory"}), 400
-        if not os.access(str(p), os.W_OK | os.X_OK):
-            return jsonify({"error": "cache_root_not_writable"}), 400
+        p, err, detail = check_cache_root_access(data["cache_root"], must_be_absolute=True)
+        if err:
+            payload = {"error": err}
+            if detail:
+                payload["detail"] = detail
+            return jsonify(payload), 400
         set_setting("cache_root", str(p))
 
     int_fields = [
@@ -2053,6 +2675,7 @@ def handle_404(_e):
 
 
 init_db()
+reconcile_runtime_states()
 
 if __name__ == "__main__":
     logger.info("PhotoNest running on %s:%s", HOST, PORT)
