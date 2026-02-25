@@ -590,12 +590,82 @@ def get_cache_encode_settings(settings):
     }
 
 
+def _prepare_cache_root(cache_root):
+    raw = str(cache_root or "").strip()
+    if not raw:
+        raise OSError("empty_cache_root")
+    root = Path(raw).expanduser()
+
+    ensure_dir(str(root))
+    for sub in ("thumb", "preview", "cover"):
+        ensure_dir(str(root / sub))
+
+    probe = root / f".perm_probe_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}"
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+    finally:
+        try:
+            if probe.exists():
+                probe.unlink()
+        except OSError:
+            pass
+
+    return str(root)
+
+
+def _cache_root_candidates(requested_root):
+    values = []
+    requested = str(requested_root or "").strip()
+    if requested:
+        values.append(requested)
+
+    env_fallback = os.environ.get("CACHE_ROOT_FALLBACK", "").strip()
+    if env_fallback:
+        values.append(env_fallback)
+
+    values.append(os.path.join(DATA_ROOT_DEFAULT, "cache_fallback"))
+    values.append(f"/tmp/photopanel-cache-{os.getuid()}")
+    values.append("/tmp/photopanel-cache")
+
+    uniq = []
+    seen = set()
+    for v in values:
+        if not v:
+            continue
+        key = str(Path(v).expanduser())
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(key)
+    return uniq
+
+
 def ensure_runtime_dirs(settings=None):
     cfg = settings or get_runtime_settings()
-    ensure_dir(cfg["cache_root"])
-    ensure_dir(os.path.join(cfg["cache_root"], "thumb"))
-    ensure_dir(os.path.join(cfg["cache_root"], "preview"))
-    ensure_dir(os.path.join(cfg["cache_root"], "cover"))
+    requested = cfg.get("cache_root", "")
+    errors = []
+
+    for candidate in _cache_root_candidates(requested):
+        try:
+            prepared = _prepare_cache_root(candidate)
+            cfg["cache_root"] = prepared
+            if prepared != str(requested):
+                logger.warning(
+                    "Configured cache_root unavailable (%s). Auto fallback to %s",
+                    requested,
+                    prepared,
+                )
+                try:
+                    set_setting("cache_root", prepared)
+                except Exception as exc:
+                    logger.warning("Persist fallback cache_root failed: %s", exc)
+            return prepared
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+
+    detail = "; ".join(errors[-5:]) if errors else "unknown_error"
+    raise PermissionError(f"no_writable_cache_root: {detail}")
 
 
 # ---------------------------------------------------------------------------
