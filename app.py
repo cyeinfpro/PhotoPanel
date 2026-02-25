@@ -1437,6 +1437,56 @@ def check_scan_runtime_control(lock_owner, phase):
             return "continue"
 
 
+def wait_scan_stopped(timeout_seconds=2.5, interval_seconds=0.15):
+    deadline = time.time() + max(0.1, float(timeout_seconds))
+    while time.time() < deadline:
+        status = snapshot_scan_status()
+        lock_state = get_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, DEFAULT_LOCK_STATE)
+        if not bool(status.get("running")) and not bool(lock_state.get("running")):
+            return True
+        time.sleep(max(0.05, float(interval_seconds)))
+    return False
+
+
+def force_finish_scan_runtime(stop_reason="aborted_by_user_forced"):
+    now = now_ts()
+    lock_state = get_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, DEFAULT_LOCK_STATE)
+    owner = str(lock_state.get("owner") or "")
+    if owner:
+        release_scan_lock(owner)
+
+    lock_state = get_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, DEFAULT_LOCK_STATE)
+    if lock_state.get("running"):
+        forced_lock = dict(lock_state)
+        forced_lock.update(
+            {
+                "running": False,
+                "owner": "",
+                "heartbeat_at": now,
+                "finished_at": now,
+            }
+        )
+        set_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, forced_lock)
+
+    status = snapshot_scan_status()
+    summary = dict(status.get("summary") or {})
+    summary["stop_reason"] = stop_reason
+    summary["forced_abort_at"] = now
+    set_scan_status(
+        running=False,
+        finished_at=now,
+        message="aborted",
+        phase="idle",
+        paused=False,
+        pause_requested=False,
+        abort_requested=False,
+        current_cache_file="",
+        stop_reason=stop_reason,
+        summary=summary,
+    )
+    update_scan_control_state(pause_requested=False, abort_requested=False)
+
+
 def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lock_owner=None):
     settings = get_runtime_settings()
     ensure_runtime_dirs(settings)
@@ -2726,10 +2776,16 @@ def admin_scan_control():
 
     # action == "abort"
     if abort_requested:
-        return jsonify({"ok": True, "status": "already_aborting"})
+        if wait_scan_stopped(timeout_seconds=0.8):
+            return jsonify({"ok": True, "status": "aborted"})
+        force_finish_scan_runtime("aborted_by_user_forced")
+        return jsonify({"ok": True, "status": "aborted_forced"})
     update_scan_control_state(pause_requested=False, abort_requested=True)
     set_scan_status(paused=False, pause_requested=False, abort_requested=True, message="aborting")
-    return jsonify({"ok": True, "status": "aborting"})
+    if wait_scan_stopped(timeout_seconds=3.0):
+        return jsonify({"ok": True, "status": "aborted"})
+    force_finish_scan_runtime("aborted_by_user_forced")
+    return jsonify({"ok": True, "status": "aborted_forced"})
 
 
 @app.route("/api/admin/panel-update/status")
