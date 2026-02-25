@@ -298,6 +298,17 @@ body {
   font-size: 12px;
 }
 
+.folder-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.folder-card .cover {
+  min-height: 120px;
+}
+
 .photo-masonry {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
@@ -627,6 +638,7 @@ const state = {
   year: '',
   albumId: null,
   albumName: '',
+  folderPath: '',
   years: [],
   albums: [],
   photos: [],
@@ -709,7 +721,18 @@ function updateBreadcrumb() {
   }
   if (state.albumId) {
     bc.push('›');
-    bc.push(`<span>${escapeHtml(state.albumName || '相册')}</span>`);
+    bc.push(`<span class="clickable" onclick="openAlbumRoot()">${escapeHtml(state.albumName || '相册')}</span>`);
+    if (state.folderPath) {
+      const parts = state.folderPath.split('/').filter(Boolean);
+      let current = '';
+      for (const part of parts) {
+        current = current ? `${current}/${part}` : part;
+        bc.push('›');
+        bc.push(
+          `<span class="clickable" data-folder="${encodeURIComponent(current)}" onclick="openFolderFromEl(this)">${escapeHtml(part)}</span>`
+        );
+      }
+    }
   }
   qs('breadcrumb').innerHTML = bc.join(' ');
 }
@@ -823,11 +846,22 @@ function openAlbumFromEl(el) {
   openAlbum(albumId, albumName).catch((e) => showActionError('打开相册失败', e));
 }
 
+function openAlbumRoot() {
+  if (!state.albumId) return;
+  openFolder('').catch((e) => showActionError('打开相册根目录失败', e));
+}
+
+function openFolderFromEl(el) {
+  const folder = decodeURIComponentSafe(el?.dataset?.folder).trim();
+  openFolder(folder).catch((e) => showActionError('打开子文件夹失败', e));
+}
+
 async function openYears() {
   state.view = 'years';
   state.year = '';
   state.albumId = null;
   state.albumName = '';
+  state.folderPath = '';
   updateBreadcrumb();
   setTitle('年份', '按年份浏览已索引项目');
 
@@ -866,6 +900,7 @@ async function openYear(year) {
   state.year = year;
   state.albumId = null;
   state.albumName = '';
+  state.folderPath = '';
   updateBreadcrumb();
   const subtitle = state.query ? `搜索 “${state.query}”` : `年份 ${year}`;
   setTitle(year, subtitle);
@@ -909,10 +944,11 @@ async function openYear(year) {
   updateHash();
 }
 
-async function openAlbum(albumId, albumName) {
+async function openAlbum(albumId, albumName, folderPath = '') {
   state.view = 'photos';
   state.albumId = albumId;
   state.albumName = albumName || '';
+  state.folderPath = String(folderPath || '').trim().replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
   state.photos = [];
   state.page = 1;
   state.hasMore = false;
@@ -920,6 +956,19 @@ async function openAlbum(albumId, albumName) {
   setTitle(state.albumName || '相册', '正在加载照片...');
 
   qs('content').innerHTML = '<div class="empty">正在加载...</div>';
+  await loadPhotoPage(true);
+  updateHash();
+}
+
+async function openFolder(folderPath = '') {
+  if (!state.albumId) return;
+  state.folderPath = String(folderPath || '').trim().replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
+  state.photos = [];
+  state.page = 1;
+  state.hasMore = false;
+  updateBreadcrumb();
+  setTitle(state.albumName || '相册', '正在加载目录...');
+  qs('content').innerHTML = '<div class="empty">正在加载目录...</div>';
   await loadPhotoPage(true);
   updateHash();
 }
@@ -934,20 +983,54 @@ async function loadPhotoPage(reset = false) {
       page: String(state.page),
       page_size: String(state.pageSize),
     });
+    if (state.folderPath) q.set('folder', state.folderPath);
 
     const data = await api(`/api/photos?${q.toString()}`);
 
     if (reset) {
       state.photos = [];
-      qs('content').innerHTML = '<div class="photo-masonry" id="photo-grid"></div><div class="load-more" id="load-more"></div>';
+      qs('content').innerHTML = '<div class="folder-grid" id="folder-grid"></div><div class="photo-masonry" id="photo-grid"></div><div class="load-more" id="load-more"></div>';
     }
 
+    state.folderPath = String(data.folder || '');
     state.photos = state.photos.concat(data.photos || []);
     state.hasMore = !!data.has_more;
     state.albumName = data.album?.name || state.albumName;
 
-    setTitle(state.albumName || '相册', `${data.total} 张照片（网格展示）`);
+    const folderName = state.folderPath ? state.folderPath.split('/').filter(Boolean).pop() : (state.albumName || '相册');
+    const folderCount = Number(data.folder_count || 0);
+    const totalDirect = Number(data.total || 0);
+    const totalRecursive = Number(data.total_recursive || totalDirect);
+    setTitle(
+      folderName || (state.albumName || '相册'),
+      `当前目录: ${folderCount} 个子文件夹 · ${totalDirect} 张直系照片（累计 ${totalRecursive} 张）`
+    );
     updateBreadcrumb();
+
+    if (reset) {
+      const folderGrid = qs('folder-grid');
+      const folders = Array.isArray(data.folders) ? data.folders : [];
+      if (folders.length) {
+        let folderHtml = '';
+        for (const f of folders) {
+          const folderPathEncoded = encodeURIComponent(String(f.path || ''));
+          const cover = f.cover_photo_id ? `/api/thumb/${f.cover_photo_id}` : '';
+          folderHtml += `
+            <article class="card folder-card" data-folder="${folderPathEncoded}" onclick="openFolderFromEl(this)">
+              <div class="cover">
+                ${cover ? `<img loading="lazy" decoding="async" src="${cover}" alt="${escapeHtml(f.name || '子文件夹')}">` : placeholder('子文件夹')}
+              </div>
+              <div class="card-body">
+                <div class="name">文件夹 · ${escapeHtml(f.name || '未命名子文件夹')}</div>
+                <div class="meta">${Number(f.photo_count || 0)} 张</div>
+              </div>
+            </article>`;
+        }
+        folderGrid.innerHTML = folderHtml;
+      } else {
+        folderGrid.innerHTML = '';
+      }
+    }
 
     const grid = qs('photo-grid');
     for (const p of data.photos || []) {
@@ -968,9 +1051,16 @@ async function loadPhotoPage(reset = false) {
       grid.appendChild(tile);
     }
 
+    if (reset && Number(data.folder_count || 0) === 0 && Number(data.total || 0) === 0) {
+      renderEmpty('当前目录为空');
+      return;
+    }
+
     const more = qs('load-more');
     if (state.hasMore) {
       more.innerHTML = '<button class="btn primary" onclick="loadMorePhotos()">加载更多</button>';
+    } else if (Number(data.total || 0) === 0 && Number(data.folder_count || 0) > 0) {
+      more.innerHTML = '<span class="badge">当前目录无直系照片</span>';
     } else {
       more.innerHTML = '<span class="badge">已加载全部照片</span>';
     }
@@ -1069,7 +1159,11 @@ function updateHash() {
   } else if (state.view === 'albums') {
     history.replaceState(null, '', `#/year/${encodeURIComponent(state.year)}`);
   } else if (state.view === 'photos') {
-    history.replaceState(null, '', `#/album/${state.albumId}`);
+    if (state.folderPath) {
+      history.replaceState(null, '', `#/album/${state.albumId}/${encodeURIComponent(state.folderPath)}`);
+    } else {
+      history.replaceState(null, '', `#/album/${state.albumId}`);
+    }
   }
 }
 
@@ -1092,7 +1186,8 @@ async function restoreFromHash() {
       await openYears();
       return;
     }
-    await openAlbum(albumId, '相册');
+    const folderPath = decodeURIComponentSafe(parts.slice(2).join('/'));
+    await openAlbum(albumId, '相册', folderPath);
     return;
   }
 

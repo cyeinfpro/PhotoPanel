@@ -817,6 +817,29 @@ def normalize_album_filter(raw_album_paths):
     return values or None
 
 
+def normalize_album_folder_path(raw_folder):
+    rel = str(raw_folder or "").strip().replace("\\", "/")
+    if not rel:
+        return ""
+
+    parts = []
+    for part in rel.split("/"):
+        p = part.strip()
+        if not p or p == ".":
+            continue
+        if p == "..":
+            return None
+        parts.append(p)
+    return "/".join(parts)
+
+
+def sql_like_prefix(value):
+    # Escape SQL LIKE wildcards so folder names containing %/_ are treated literally.
+    v = str(value or "")
+    v = v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{v}%"
+
+
 def _probe_dir_readable(path_obj):
     try:
         with os.scandir(path_obj) as it:
@@ -2636,16 +2659,67 @@ def api_photos():
     except (TypeError, ValueError):
         return jsonify({"error": "invalid_page_size"}), 400
 
+    folder = normalize_album_folder_path(request.args.get("folder", ""))
+    if folder is None:
+        return jsonify({"error": "invalid_folder"}), 400
+
     album = get_album_for_user(album_id)
     if not album:
         return jsonify({"error": "album_not_accessible"}), 403
 
+    album_rel = str(album["rel_path"] or "").strip().strip("/")
+    base_prefix = f"{album_rel}/" if album_rel else ""
+    if folder:
+        base_prefix = f"{base_prefix}{folder}/"
+    like_pattern = sql_like_prefix(base_prefix)
+    start_pos = len(base_prefix) + 1
+
     offset = (page - 1) * page_size
+    parent_folder = ""
+    if folder:
+        parent_folder = folder.rsplit("/", 1)[0] if "/" in folder else ""
 
     with get_db_conn() as conn:
+        if folder:
+            folder_exists = conn.execute(
+                "SELECT 1 FROM photos WHERE album_id = ? AND rel_path LIKE ? ESCAPE '\\' LIMIT 1",
+                (album_id, like_pattern),
+            ).fetchone()
+            if not folder_exists:
+                return jsonify({"error": "folder_not_found"}), 404
+
+        total_recursive = conn.execute(
+            "SELECT COUNT(*) AS c FROM photos WHERE album_id = ? AND rel_path LIKE ? ESCAPE '\\'",
+            (album_id, like_pattern),
+        ).fetchone()["c"]
+
+        folder_rows = conn.execute(
+            """
+            SELECT
+              SUBSTR(SUBSTR(rel_path, ?), 1, INSTR(SUBSTR(rel_path, ?), '/') - 1) AS folder_name,
+              COUNT(*) AS photo_count,
+              MIN(id) AS cover_photo_id
+            FROM photos
+            WHERE album_id = ?
+              AND rel_path LIKE ?
+              ESCAPE '\\'
+              AND INSTR(SUBSTR(rel_path, ?), '/') > 0
+            GROUP BY folder_name
+            ORDER BY folder_name ASC
+            """,
+            (start_pos, start_pos, album_id, like_pattern, start_pos),
+        ).fetchall()
+
         total = conn.execute(
-            "SELECT COUNT(*) AS c FROM photos WHERE album_id = ?",
-            (album_id,),
+            """
+            SELECT COUNT(*) AS c
+            FROM photos
+            WHERE album_id = ?
+              AND rel_path LIKE ?
+              ESCAPE '\\'
+              AND INSTR(SUBSTR(rel_path, ?), '/') = 0
+            """,
+            (album_id, like_pattern, start_pos),
         ).fetchone()["c"]
 
         rows = conn.execute(
@@ -2653,11 +2727,29 @@ def api_photos():
             SELECT id, filename, size, mtime
             FROM photos
             WHERE album_id = ?
+              AND rel_path LIKE ?
+              ESCAPE '\\'
+              AND INSTR(SUBSTR(rel_path, ?), '/') = 0
             ORDER BY filename ASC
             LIMIT ? OFFSET ?
             """,
-            (album_id, page_size, offset),
+            (album_id, like_pattern, start_pos, page_size, offset),
         ).fetchall()
+
+    folders = []
+    for r in folder_rows:
+        folder_name = str(r["folder_name"] or "").strip()
+        if not folder_name:
+            continue
+        next_path = f"{folder}/{folder_name}" if folder else folder_name
+        folders.append(
+            {
+                "name": folder_name,
+                "path": next_path,
+                "photo_count": int(r["photo_count"] or 0),
+                "cover_photo_id": r["cover_photo_id"],
+            }
+        )
 
     photos = [
         {
@@ -2676,10 +2768,16 @@ def api_photos():
                 "year": album["year"],
                 "name": album["name"],
                 "photo_count": album["photo_count"],
+                "rel_path": album["rel_path"],
             },
+            "folder": folder,
+            "parent_folder": parent_folder,
+            "folders": folders,
+            "folder_count": len(folders),
             "page": page,
             "page_size": page_size,
             "total": total,
+            "total_recursive": int(total_recursive or 0),
             "photos": photos,
             "has_more": offset + len(photos) < total,
         }
