@@ -267,67 +267,67 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
 
       <div class="row3">
         <div>
-          <label>MAX_SCAN_ALBUMS_PER_RUN</label>
+          <label>单次扫描项目上限</label>
           <input id="max_scan_albums_per_run" type="number" min="1">
         </div>
         <div>
-          <label>MAX_SCAN_FILES_PER_ALBUM</label>
+          <label>单个项目扫描文件上限</label>
           <input id="max_scan_files_per_album" type="number" min="10">
         </div>
         <div>
-          <label>MAX_NEW_THUMBS_PER_RUN</label>
+          <label>单次转码任务上限</label>
           <input id="max_new_thumbs_per_run" type="number" min="1">
         </div>
       </div>
 
       <div class="row3">
         <div>
-          <label>WORKERS</label>
+          <label>并发线程数</label>
           <input id="workers" type="number" min="1" max="16">
         </div>
         <div>
-          <label>TIME_BUDGET_SECONDS</label>
+          <label>单次任务时间预算（秒）</label>
           <input id="time_budget_seconds" type="number" min="10">
         </div>
         <div>
-          <label>PREHEAT_COUNT (发布后预热)</label>
+          <label>每个项目预热数量（发布后预热）</label>
           <input id="preheat_count" type="number" min="0">
         </div>
       </div>
 
       <div class="row3">
         <div>
-          <label>THUMB_MAX_EDGE (px)</label>
+          <label>缩略图最大边长（px）</label>
           <input id="thumb_max_edge" type="number" min="240" max="1024">
         </div>
         <div>
-          <label>PREVIEW_MAX_EDGE (px)</label>
+          <label>预览图最大边长（px）</label>
           <input id="preview_max_edge" type="number" min="960" max="3840">
         </div>
         <div>
-          <label>WEBP_METHOD (0-6)</label>
+          <label>WebP 压缩方法（0-6）</label>
           <input id="webp_method" type="number" min="0" max="6">
         </div>
       </div>
 
       <div class="row3">
         <div>
-          <label>THUMB_QUALITY (50-92)</label>
+          <label>缩略图质量（50-92）</label>
           <input id="thumb_quality" type="number" min="50" max="92">
         </div>
         <div>
-          <label>PREVIEW_QUALITY (55-95)</label>
+          <label>预览图质量（55-95）</label>
           <input id="preview_quality" type="number" min="55" max="95">
         </div>
         <div>
-          <label>THUMB_TARGET_KB</label>
+          <label>缩略图目标大小（KB）</label>
           <input id="thumb_target_kb" type="number" min="40" max="600">
         </div>
       </div>
 
       <div class="row3">
         <div>
-          <label>PREVIEW_TARGET_KB</label>
+          <label>预览图目标大小（KB）</label>
           <input id="preview_target_kb" type="number" min="200" max="6000">
         </div>
         <div></div>
