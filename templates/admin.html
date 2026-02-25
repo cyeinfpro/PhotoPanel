@@ -354,12 +354,12 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
 
   <section class="card" id="scan-card">
     <h3>扫描任务</h3>
-    <div class="muted">支持按年份/项目定向扫描，增量索引 + 限流执行</div>
+    <div class="muted">支持按年份/项目定向扫描，扫描与转码全量执行直到完成</div>
     <div style="height:10px"></div>
 
     <div class="row">
       <div>
-        <label>只扫年份（逗号分隔，可空）</label>
+        <label>只扫年份（逗号分隔，可空；非年份目录会一并扫描）</label>
         <input id="scan_years" placeholder="2025,2026">
       </div>
       <div>

@@ -245,21 +245,24 @@ body {
     linear-gradient(140deg, #eef5ff, #f8fbff),
     linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(255, 255, 255, 0.84));
   border-bottom: 1px solid var(--line);
-  min-height: 140px;
+  min-height: 0;
+  aspect-ratio: 16 / 10;
   position: relative;
   padding: 8px;
 }
 
 .cover img {
   width: 100%;
-  height: auto;
+  height: 100%;
   display: block;
   border-radius: 12px;
-  object-fit: contain;
+  object-fit: cover;
+  object-position: center center;
 }
 
 .cover-placeholder {
-  min-height: 124px;
+  min-height: 100%;
+  height: 100%;
   border-radius: 12px;
   border: 1px dashed rgba(45, 79, 140, 0.22);
   display: grid;
@@ -306,7 +309,7 @@ body {
 }
 
 .folder-card .cover {
-  min-height: 120px;
+  aspect-ratio: 16 / 9;
 }
 
 .photo-masonry {
@@ -350,7 +353,7 @@ body {
   width: 100%;
   height: 100%;
   display: block;
-  object-fit: contain;
+  object-fit: cover;
   object-position: center center;
 }
 
@@ -392,12 +395,18 @@ body {
 }
 
 .photo-meta {
-  padding: 8px 9px 9px;
+  padding: 6px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .photo-filename {
-  font-size: 12px;
-  font-weight: 500;
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 580;
   color: #1e2b44;
   white-space: nowrap;
   overflow: hidden;
@@ -405,9 +414,14 @@ body {
 }
 
 .photo-size {
-  margin-top: 3px;
+  margin-top: 0;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(73, 102, 152, 0.18);
+  background: rgba(242, 247, 255, 0.86);
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
 }
 
 .load-more {
@@ -1021,7 +1035,7 @@ async function loadPhotoPage(reset = false) {
                 ${cover ? `<img loading="lazy" decoding="async" src="${cover}" alt="${escapeHtml(f.name || '子文件夹')}">` : placeholder('子文件夹')}
               </div>
               <div class="card-body">
-                <div class="name">文件夹 · ${escapeHtml(f.name || '未命名子文件夹')}</div>
+                <div class="name">${escapeHtml(f.name || '未命名子文件夹')}</div>
                 <div class="meta">${Number(f.photo_count || 0)} 张</div>
               </div>
             </article>`;

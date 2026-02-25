@@ -10,6 +10,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -1017,6 +1018,51 @@ def safe_join(root, rel_path):
     raise ValueError("path escapes root")
 
 
+def is_landscape_source_photo(photo_root, rel_path):
+    try:
+        src = safe_join(photo_root, rel_path)
+        with Image.open(src) as img:
+            width, height = img.size
+            try:
+                orientation = int((img.getexif() or {}).get(274, 1))
+            except Exception:
+                orientation = 1
+            # EXIF orientations 5-8 swap width/height.
+            if orientation in {5, 6, 7, 8}:
+                width, height = height, width
+            return width >= height
+    except Exception:
+        return False
+
+
+def pick_landscape_cover_photo_id(conn, album_id, rel_prefix, photo_root, fallback_id=None, sample_limit=20):
+    rows = conn.execute(
+        """
+        SELECT id, rel_path
+        FROM photos
+        WHERE album_id = ? AND rel_path LIKE ? ESCAPE '\\'
+        ORDER BY filename ASC
+        LIMIT ?
+        """,
+        (album_id, sql_like_prefix(rel_prefix), int(max(1, sample_limit))),
+    ).fetchall()
+    if not rows:
+        return fallback_id
+
+    fallback = int(rows[0]["id"])
+    if fallback_id:
+        try:
+            fallback = int(fallback_id)
+        except (TypeError, ValueError):
+            pass
+
+    for r in rows:
+        rel_path = str(r["rel_path"] or "")
+        if is_landscape_source_photo(photo_root, rel_path):
+            return int(r["id"])
+    return fallback
+
+
 def cache_rel_without_ext(rel_path):
     return os.path.splitext(rel_path)[0] + CACHE_EXT
 
@@ -1300,33 +1346,48 @@ def discover_albums(photo_root, years_filter=None, album_filter=None, exclude_di
     if not root.is_dir():
         return []
 
-    excludes = set(exclude_dirs or [])
+    excludes = {str(v).strip().lower() for v in (exclude_dirs or []) if str(v).strip()}
     albums = []
 
     try:
-        for year_name in sorted(os.listdir(root)):
-            if is_hidden_name(year_name):
-                continue
-            if years_filter and year_name not in years_filter:
+        for top_name in sorted(os.listdir(root)):
+            if is_hidden_name(top_name) or top_name.strip().lower() in excludes:
                 continue
 
-            year_path = root / year_name
-            if not year_path.is_dir():
+            # years_filter only applies to year-like top folders (e.g. 2025).
+            # Non-year folders are still scanned so "Judy/..." style trees are included.
+            if years_filter and re.fullmatch(r"\d{4}", top_name) and top_name not in years_filter:
                 continue
 
-            for album_name in sorted(os.listdir(year_path)):
-                if is_hidden_name(album_name) or album_name in excludes:
+            top_path = root / top_name
+            if not top_path.is_dir():
+                continue
+
+            child_dirs = []
+            for child_name in sorted(os.listdir(top_path)):
+                if is_hidden_name(child_name) or child_name.strip().lower() in excludes:
                     continue
 
-                album_path = year_path / album_name
-                if not album_path.is_dir():
+                child_path = top_path / child_name
+                if not child_path.is_dir():
                     continue
 
-                rel = f"{year_name}/{album_name}"
+                rel = f"{top_name}/{child_name}"
                 if album_filter and rel not in album_filter:
                     continue
 
-                albums.append((year_name, album_name, rel, album_path))
+                child_dirs.append((top_name, child_name, rel, child_path))
+
+            if child_dirs:
+                albums.extend(child_dirs)
+                if album_filter and top_name in album_filter:
+                    # Explicitly requested top-level folder: scan as one project recursively.
+                    albums.append((top_name, top_name, top_name, top_path))
+            else:
+                # Support single-level projects directly under PHOTO_ROOT.
+                rel = top_name
+                if not album_filter or rel in album_filter:
+                    albums.append((top_name, top_name, rel, top_path))
     except FileNotFoundError:
         return []
 
@@ -1378,6 +1439,14 @@ def index_single_album(
     updated_files = 0
 
     excluded_names = {str(v).strip().lower() for v in (exclude_dirs or []) if str(v).strip()}
+    limit_files = None
+    try:
+        if max_files_per_album is not None:
+            parsed_limit = int(max_files_per_album)
+            if parsed_limit > 0:
+                limit_files = parsed_limit
+    except (TypeError, ValueError):
+        limit_files = None
 
     for root, dirnames, filenames in os.walk(album_path, topdown=True):
         if control_hook:
@@ -1395,7 +1464,7 @@ def index_single_album(
                 action = control_hook()
                 if action == "abort":
                     raise ScanAbortRequested()
-            if scanned_files >= max_files_per_album:
+            if limit_files is not None and scanned_files >= limit_files:
                 break
             if is_hidden_name(name):
                 continue
@@ -1457,7 +1526,7 @@ def index_single_album(
 
             sorted_photo_items.append((rel_inside, photo_id, rel, src_mtime, changed))
 
-        if scanned_files >= max_files_per_album:
+        if limit_files is not None and scanned_files >= limit_files:
             break
 
     deleted_files = 0
@@ -1623,13 +1692,8 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
     ensure_runtime_dirs(settings)
 
     workers = get_int_setting(settings, "workers", 4, 1, 16)
-    max_scan_albums = get_int_setting(settings, "max_scan_albums_per_run", 80, 1, 50000)
-    max_files_per_album = get_int_setting(settings, "max_scan_files_per_album", 5000, 10, 1000000)
-    max_new_thumbs = get_int_setting(settings, "max_new_thumbs_per_run", 3000, 1, 1000000)
-    time_budget = get_int_setting(settings, "time_budget_seconds", 900, 10, 86400)
-    preheat_count = get_int_setting(settings, "preheat_count", 200, 0, 10000)
-    if trigger == "manual" and preheat_count <= 0:
-        preheat_count = int(SETTINGS_DEFAULTS.get("preheat_count", "200"))
+    # Scan/transcode now run until completion (no hard stop by album count/time/cache budget).
+    max_files_per_album = None
 
     allowed_exts = parse_exts(settings.get("allowed_extensions"))
     exclude_dirs = parse_csv(settings.get("exclude_dirs"))
@@ -1667,12 +1731,12 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
     summary = {
         "trigger": trigger,
         "limits": {
-            "max_scan_albums_per_run": max_scan_albums,
-            "max_scan_files_per_album": max_files_per_album,
-            "max_new_thumbs_per_run": max_new_thumbs,
+            "max_scan_albums_per_run": "unlimited",
+            "max_scan_files_per_album": "unlimited",
+            "max_new_thumbs_per_run": "unlimited",
             "workers": workers,
-            "time_budget_seconds": time_budget,
-            "preheat_count": preheat_count,
+            "time_budget_seconds": "unlimited",
+            "preheat_count": "disabled",
         },
         "years_filter": sorted(list(years_filter or [])),
         "album_filter": sorted(list(album_filter or [])),
@@ -1685,7 +1749,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
             album_filter=album_filter,
             exclude_dirs=exclude_dirs,
         )
-        scan_target_albums = min(len(albums), max_scan_albums)
+        scan_target_albums = len(albums)
         set_scan_status(found_albums=len(albums), scan_target_albums=scan_target_albums)
 
         processed_albums = 0
@@ -1700,9 +1764,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
 
         cache_tasks = []
         queued_photo_ids = set()
-        cache_budget = max_new_thumbs
         recent_cache_items = []
-        manual_scan_mode = trigger == "manual"
 
         with get_db_conn() as conn:
             for year, album_name, rel_path, album_path in albums:
@@ -1712,12 +1774,6 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                     break
                 if lock_owner:
                     touch_scan_lock(lock_owner)
-                if visited_albums >= max_scan_albums:
-                    stop_reason = "max_scan_albums_per_run"
-                    break
-                if time.time() - start >= time_budget:
-                    stop_reason = "time_budget_seconds"
-                    break
 
                 visited_albums += 1
 
@@ -1732,13 +1788,13 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                     )
                     continue
 
-                album_id, is_published, old_dir_mtime = upsert_album(
+                album_id, _is_published, old_dir_mtime = upsert_album(
                     conn, year, album_name, rel_path, dir_mtime
                 )
 
                 # For manual scans, do not short-circuit by album dir mtime.
                 # Admin explicitly triggered a scan and expects immediate processing.
-                if not force and old_dir_mtime == dir_mtime and not manual_scan_mode:
+                if not force and old_dir_mtime == dir_mtime and trigger != "manual":
                     skipped_albums += 1
                     set_scan_status(
                         processed_albums=processed_albums,
@@ -1767,28 +1823,11 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                 updated_files += res["updated_files"]
                 deleted_files += res["deleted_files"]
 
-                if preheat_count > 0 and cache_budget > 0:
-                    preheat_added = 0
-                    for _, photo_id, photo_rel, src_mtime, changed in res["photo_items"]:
-                        if preheat_added >= preheat_count or cache_budget <= 0:
-                            break
-                        should_preheat = False
-                        if is_published and changed:
-                            should_preheat = True
-                        elif manual_scan_mode:
-                            # Manual scans allow cache warmup even when album is not
-                            # published or files are unchanged.
-                            should_preheat = True
-
-                        if not should_preheat:
-                            continue
-                        if photo_id in queued_photo_ids:
-                            continue
-
-                        cache_tasks.append((photo_id, photo_rel, src_mtime))
-                        queued_photo_ids.add(photo_id)
-                        cache_budget -= 1
-                        preheat_added += 1
+                for _, photo_id, photo_rel, src_mtime, _changed in res["photo_items"]:
+                    if photo_id in queued_photo_ids:
+                        continue
+                    cache_tasks.append((photo_id, photo_rel, src_mtime))
+                    queued_photo_ids.add(photo_id)
 
                 conn.commit()
 
@@ -1801,10 +1840,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                     deleted_files=deleted_files,
                 )
 
-            # Preheat queue:
-            # 1) default: changed photos in published albums
-            # 2) manual targeted scan: selected albums can warm cache regardless
-            #    of publish state and change flag
+            # Transcode queue: all photos from scanned projects.
             if stop_reason != "aborted_by_user":
                 queue_preview = [t[1] for t in cache_tasks[:8]]
                 recent_cache_items = [f"[排队] {p}" for p in queue_preview]
@@ -1816,7 +1852,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                     current_cache_file=current_cache_file,
                     recent_cache_items=recent_cache_items,
                 )
-                if cache_tasks and time.time() - start < time_budget:
+                if cache_tasks:
                     pool = ThreadPoolExecutor(max_workers=workers)
                     future_to_task = {}
                     pending_index = 0
@@ -1833,9 +1869,6 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                                 break
                             if lock_owner:
                                 touch_scan_lock(lock_owner)
-                            if time.time() - start >= time_budget:
-                                stop_reason = stop_reason or "time_budget_seconds"
-                                break
 
                             while pending_index < pending_total and len(future_to_task) < workers:
                                 task = cache_tasks[pending_index]
@@ -1914,7 +1947,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                                     recent_cache_items=recent_cache_items,
                                 )
                     finally:
-                        if stop_reason in {"time_budget_seconds", "aborted_by_user"} and future_to_task:
+                        if stop_reason == "aborted_by_user" and future_to_task:
                             for fut in future_to_task:
                                 fut.cancel()
                             pool.shutdown(wait=False, cancel_futures=True)
@@ -1943,9 +1976,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
         set_setting("last_scan_summary", json.dumps(summary, ensure_ascii=False))
 
         final_message = "completed"
-        if stop_reason in {"max_scan_albums_per_run", "time_budget_seconds"}:
-            final_message = "completed_with_limit"
-        elif stop_reason == "aborted_by_user":
+        if stop_reason == "aborted_by_user":
             final_message = "aborted"
         elif stop_reason == "no_album_matched":
             final_message = "completed_no_match"
@@ -2666,6 +2697,8 @@ def api_photos():
     album = get_album_for_user(album_id)
     if not album:
         return jsonify({"error": "album_not_accessible"}), 403
+    settings = get_runtime_settings()
+    photo_root = settings.get("photo_root", "")
 
     album_rel = str(album["rel_path"] or "").strip().strip("/")
     base_prefix = f"{album_rel}/" if album_rel else ""
@@ -2737,19 +2770,28 @@ def api_photos():
         ).fetchall()
 
     folders = []
-    for r in folder_rows:
-        folder_name = str(r["folder_name"] or "").strip()
-        if not folder_name:
-            continue
-        next_path = f"{folder}/{folder_name}" if folder else folder_name
-        folders.append(
-            {
-                "name": folder_name,
-                "path": next_path,
-                "photo_count": int(r["photo_count"] or 0),
-                "cover_photo_id": r["cover_photo_id"],
-            }
-        )
+    with get_db_conn() as conn:
+        for r in folder_rows:
+            folder_name = str(r["folder_name"] or "").strip()
+            if not folder_name:
+                continue
+            next_path = f"{folder}/{folder_name}" if folder else folder_name
+            folder_rel_prefix = f"{album_rel}/{next_path}/" if album_rel else f"{next_path}/"
+            cover_photo_id = pick_landscape_cover_photo_id(
+                conn,
+                album_id,
+                folder_rel_prefix,
+                photo_root,
+                fallback_id=r["cover_photo_id"],
+            )
+            folders.append(
+                {
+                    "name": folder_name,
+                    "path": next_path,
+                    "photo_count": int(r["photo_count"] or 0),
+                    "cover_photo_id": cover_photo_id,
+                }
+            )
 
     photos = [
         {
