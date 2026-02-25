@@ -474,6 +474,34 @@ def now_ts():
     return int(time.time())
 
 
+def parse_lock_owner_pid(owner):
+    raw = str(owner or "").strip()
+    if not raw:
+        return None
+    head = raw.split("-", 1)[0]
+    if not head.isdigit():
+        return None
+    try:
+        pid = int(head)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def is_pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def _acquire_runtime_lock(lock_key, stale_seconds):
     owner = f"{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:10]}"
     now = now_ts()
@@ -1819,6 +1847,22 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
     start_ts = int(time.time())
     start = time.time()
 
+    summary = {
+        "trigger": trigger,
+        "mode": "scan_index",
+        "force": bool(force),
+        "limits": {
+            "max_scan_albums_per_run": "unlimited",
+            "max_scan_files_per_album": "unlimited",
+            "max_new_thumbs_per_run": "unlimited",
+            "workers": workers,
+            "time_budget_seconds": "unlimited",
+            "preheat_count": "disabled",
+        },
+        "years_filter": sorted(list(years_filter or [])),
+        "album_filter": sorted(list(album_filter or [])),
+    }
+
     set_scan_status(
         running=True,
         started_at=start_ts,
@@ -1843,22 +1887,8 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
         current_cache_file="",
         recent_cache_items=[],
         stop_reason=None,
-        summary={},
+        summary=summary,
     )
-
-    summary = {
-        "trigger": trigger,
-        "limits": {
-            "max_scan_albums_per_run": "unlimited",
-            "max_scan_files_per_album": "unlimited",
-            "max_new_thumbs_per_run": "unlimited",
-            "workers": workers,
-            "time_budget_seconds": "unlimited",
-            "preheat_count": "disabled",
-        },
-        "years_filter": sorted(list(years_filter or [])),
-        "album_filter": sorted(list(album_filter or [])),
-    }
 
     try:
         albums = discover_albums(
@@ -2053,6 +2083,21 @@ def run_transcode_task(trigger, years_filter=None, album_filter=None, force=Fals
     start = time.time()
     start_ts = int(start)
 
+    summary = {
+        "trigger": trigger,
+        "mode": "transcode_only",
+        "force": bool(force),
+        "limits": {
+            "workers": workers,
+            "max_scan_albums_per_run": "unlimited",
+            "max_scan_files_per_album": "unlimited",
+            "max_new_thumbs_per_run": "unlimited",
+            "time_budget_seconds": "unlimited",
+        },
+        "years_filter": sorted(list(years_filter or [])),
+        "album_filter": sorted(list(album_filter or [])),
+    }
+
     set_scan_status(
         running=True,
         started_at=start_ts,
@@ -2077,23 +2122,8 @@ def run_transcode_task(trigger, years_filter=None, album_filter=None, force=Fals
         current_cache_file="",
         recent_cache_items=[],
         stop_reason=None,
-        summary={},
+        summary=summary,
     )
-
-    summary = {
-        "trigger": trigger,
-        "mode": "transcode_only",
-        "force": bool(force),
-        "limits": {
-            "workers": workers,
-            "max_scan_albums_per_run": "unlimited",
-            "max_scan_files_per_album": "unlimited",
-            "max_new_thumbs_per_run": "unlimited",
-            "time_budget_seconds": "unlimited",
-        },
-        "years_filter": sorted(list(years_filter or [])),
-        "album_filter": sorted(list(album_filter or [])),
-    }
 
     stop_reason = None
     generated_cache_pairs = 0
@@ -3404,6 +3434,53 @@ def admin_scan_control():
         if not paused and not pause_requested:
             return jsonify({"error": "scan_not_paused"}), 409
         update_scan_control_state(pause_requested=False, abort_requested=False)
+        current_pid_prefix = f"{os.getpid()}-"
+        owner = str(lock_state.get("owner") or "")
+        owner_pid = parse_lock_owner_pid(owner)
+        owner_alive = is_pid_alive(owner_pid) if owner_pid is not None else False
+        owner_is_current_process = owner.startswith(current_pid_prefix)
+        needs_local_resume_worker = (
+            bool(status.get("running"))
+            and (
+                (not bool(lock_state.get("running")))
+                or (not owner)
+                or (not owner_is_current_process and not owner_alive)
+            )
+        )
+
+        if needs_local_resume_worker:
+            if bool(lock_state.get("running")) and owner:
+                release_scan_lock(owner)
+
+            phase = str(status.get("phase") or "scanning").strip().lower()
+            trigger = str(status.get("trigger") or "manual").strip().lower() or "manual"
+            summary = status.get("summary") if isinstance(status.get("summary"), dict) else {}
+            years_filter = normalize_years_filter(summary.get("years_filter"))
+            album_filter = normalize_album_filter(summary.get("album_filter"))
+            force = parse_bool(summary.get("force", False))
+
+            if phase == "transcoding":
+                started = start_transcode(
+                    trigger=trigger,
+                    years_filter=years_filter,
+                    album_filter=album_filter,
+                    force=force,
+                )
+            else:
+                started = start_scan(
+                    trigger=trigger,
+                    years_filter=years_filter,
+                    album_filter=album_filter,
+                    force=force,
+                )
+
+            if not started:
+                set_scan_status(paused=True, pause_requested=True, abort_requested=False, message="paused")
+                update_scan_control_state(pause_requested=True, abort_requested=False)
+                return jsonify({"error": "scan_resume_restart_failed"}), 409
+
+            return jsonify({"ok": True, "status": "resumed_restarted"})
+
         set_scan_status(paused=False, pause_requested=False, abort_requested=False, message="running")
         return jsonify({"ok": True, "status": "resuming"})
 
