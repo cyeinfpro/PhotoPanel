@@ -609,7 +609,9 @@ function updateBreadcrumb() {
   bc.push(`<span class="clickable" onclick="openYears()">全部年份</span>`);
   if (state.year) {
     bc.push('›');
-    bc.push(`<span class="clickable" onclick="openYear(${JSON.stringify(state.year)})">${state.year}</span>`);
+    bc.push(
+      `<span class="clickable" data-year="${encodeURIComponent(state.year)}" onclick="openYearFromEl(this)">${escapeHtml(state.year)}</span>`
+    );
   }
   if (state.albumId) {
     bc.push('›');
@@ -649,6 +651,32 @@ function placeholder(text) {
   return `<div class="cover-placeholder">${escapeHtml(text)}</div>`;
 }
 
+function decodeURIComponentSafe(value) {
+  try {
+    return decodeURIComponent(String(value || ''));
+  } catch (_e) {
+    return String(value || '');
+  }
+}
+
+function showActionError(prefix, error) {
+  const msg = String(error?.message || error || '请求失败');
+  alert(`${prefix}: ${msg}`);
+}
+
+function openYearFromEl(el) {
+  const year = decodeURIComponentSafe(el?.dataset?.year).trim();
+  if (!year) return;
+  openYear(year).catch((e) => showActionError('打开年份失败', e));
+}
+
+function openAlbumFromEl(el) {
+  const albumId = Number(el?.dataset?.albumId || 0);
+  if (!Number.isFinite(albumId) || albumId <= 0) return;
+  const albumName = decodeURIComponentSafe(el?.dataset?.albumName);
+  openAlbum(albumId, albumName).catch((e) => showActionError('打开相册失败', e));
+}
+
 async function openYears() {
   state.view = 'years';
   state.year = '';
@@ -670,8 +698,9 @@ async function openYears() {
   let html = '<div class="grid years">';
   for (const y of state.years) {
     const cover = y.cover_photo_id ? `/api/thumb/${y.cover_photo_id}` : '';
+    const yearEncoded = encodeURIComponent(String(y.year || ''));
     html += `
-      <article class="card" onclick="openYear(${JSON.stringify(y.year)})">
+      <article class="card" data-year="${yearEncoded}" onclick="openYearFromEl(this)">
         <div class="cover">
           ${cover ? `<img loading="lazy" decoding="async" src="${cover}" alt="${escapeHtml(y.year)}">` : placeholder('无封面')}
         </div>
@@ -712,12 +741,13 @@ async function openYear(year) {
   let html = '<div class="grid albums">';
   for (const a of state.albums) {
     const cover = `/api/cover/${a.id}`;
+    const albumNameEncoded = encodeURIComponent(String(a.name || ''));
     const publishTag = CURRENT_USER.role === 'admin'
       ? `<span class="tag" style="background:${a.published ? 'rgba(16,185,129,.86)' : 'rgba(245,158,11,.86)'};">${a.published ? '已发布' : '未发布'}</span>`
       : '';
 
     html += `
-      <article class="card" onclick="openAlbum(${a.id}, ${JSON.stringify(a.name)})">
+      <article class="card" data-album-id="${a.id}" data-album-name="${albumNameEncoded}" onclick="openAlbumFromEl(this)">
         <div class="cover">
           <img loading="lazy" decoding="async" src="${cover}" alt="${escapeHtml(a.name)}">
           ${publishTag}
