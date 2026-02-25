@@ -49,6 +49,7 @@ except Exception:
 PHOTO_ROOT_DEFAULT = os.environ.get("PHOTO_ROOT", "/mnt/nas/photos")
 CACHE_ROOT_DEFAULT = os.environ.get("CACHE_ROOT", "/var/lib/photopanel/cache")
 DATA_ROOT_DEFAULT = os.environ.get("DATA_ROOT", "/var/lib/photopanel/data")
+PANEL_REPO_URL_DEFAULT = os.environ.get("PANEL_REPO_URL", "https://github.com/cyeinfpro/PhotoPanel")
 
 DB_PATH = os.environ.get("PHOTO_DB", os.path.join(DATA_ROOT_DEFAULT, "photopanel.db"))
 SECRET_KEY = os.environ.get("SECRET_KEY", "photopanel-change-me")
@@ -1331,6 +1332,8 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
     max_new_thumbs = get_int_setting(settings, "max_new_thumbs_per_run", 3000, 1, 1000000)
     time_budget = get_int_setting(settings, "time_budget_seconds", 900, 10, 86400)
     preheat_count = get_int_setting(settings, "preheat_count", 200, 0, 10000)
+    if trigger == "manual" and preheat_count <= 0:
+        preheat_count = int(SETTINGS_DEFAULTS.get("preheat_count", "200"))
 
     allowed_exts = parse_exts(settings.get("allowed_extensions"))
     exclude_dirs = parse_csv(settings.get("exclude_dirs"))
@@ -1399,7 +1402,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
         queued_photo_ids = set()
         cache_budget = max_new_thumbs
         recent_cache_items = []
-        manual_selected_mode = trigger == "manual" and bool(album_filter)
+        manual_scan_mode = trigger == "manual"
 
         with get_db_conn() as conn:
             for year, album_name, rel_path, album_path in albums:
@@ -1429,8 +1432,9 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                     conn, year, album_name, rel_path, dir_mtime
                 )
 
-                # For manual targeted scans, do not short-circuit by album dir mtime.
-                if not force and old_dir_mtime == dir_mtime and not manual_selected_mode:
+                # For manual scans, do not short-circuit by album dir mtime.
+                # Admin explicitly triggered a scan and expects immediate processing.
+                if not force and old_dir_mtime == dir_mtime and not manual_scan_mode:
                     skipped_albums += 1
                     set_scan_status(
                         processed_albums=processed_albums,
@@ -1461,9 +1465,9 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                         should_preheat = False
                         if is_published and changed:
                             should_preheat = True
-                        elif manual_selected_mode:
-                            # Admin manually selected album path(s): allow cache warmup
-                            # even when album is not published or files are unchanged.
+                        elif manual_scan_mode:
+                            # Manual scans allow cache warmup even when album is not
+                            # published or files are unchanged.
                             should_preheat = True
 
                         if not should_preheat:
@@ -1707,17 +1711,58 @@ def read_process_cmdline(pid):
         return ""
 
 
+def detect_app_revision(app_dir):
+    root = Path(app_dir).resolve()
+    git_dir = root / ".git"
+    if git_dir.exists() and shutil.which("git"):
+        try:
+            rev = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+                text=True,
+            ).strip()
+            if rev:
+                return f"git:{rev}"
+        except Exception:
+            pass
+
+    app_file = root / "app.py"
+    try:
+        st = app_file.stat()
+        return f"mtime:{int(st.st_mtime)} size:{st.st_size}"
+    except OSError:
+        return "unknown"
+
+
+def build_repo_full_sync_command(app_dir, repo_url):
+    app_q = shlex.quote(str(Path(app_dir).resolve()))
+    repo_q = shlex.quote(str(repo_url))
+    return (
+        "set -e; "
+        f"mkdir -p {app_q}; "
+        "tmp_dir=/tmp/photopanel-sync.$(date +%s).$$; "
+        "rm -rf \"$tmp_dir\"; "
+        f"git clone {repo_q} \"$tmp_dir\"; "
+        "if command -v rsync >/dev/null 2>&1; then "
+        f"rsync -a --delete --exclude '.venv/' --exclude '__pycache__/' --exclude '*.pyc' \"$tmp_dir/\" {app_q}/; "
+        "else "
+        f"cp -a \"$tmp_dir/.\" {app_q}/; "
+        "fi; "
+        "rm -rf \"$tmp_dir\""
+    )
+
+
 def build_panel_update_steps():
     app_dir = Path(os.environ.get("PANEL_APP_DIR", str(Path(__file__).resolve().parent))).resolve()
     custom_update_cmd = os.environ.get("PANEL_UPDATE_CMD", "").strip()
+    repo_url = os.environ.get("PANEL_REPO_URL", PANEL_REPO_URL_DEFAULT).strip() or PANEL_REPO_URL_DEFAULT
     steps = []
 
     if custom_update_cmd:
         steps.append(("执行自定义更新命令", custom_update_cmd))
     else:
-        git_dir = app_dir / ".git"
-        if git_dir.exists():
-            steps.append(("拉取最新代码", f"git -C {shlex.quote(str(app_dir))} pull --ff-only"))
+        if not shutil.which("git"):
+            raise RuntimeError("系统缺少 git，无法执行面板更新")
+        steps.append(("同步最新代码", build_repo_full_sync_command(app_dir, repo_url)))
 
         requirements_file = app_dir / "requirements.txt"
         custom_venv_python = os.environ.get("PANEL_VENV_PYTHON", "").strip()
@@ -1795,6 +1840,8 @@ def run_panel_update_task(trigger, lock_owner):
 
     try:
         app_dir, steps = build_panel_update_steps()
+        before_rev = detect_app_revision(app_dir)
+        append_panel_update_log(f"更新前版本: {before_rev}")
         if not steps:
             raise RuntimeError("没有可执行的更新步骤，请检查仓库和更新命令配置")
 
@@ -1822,6 +1869,11 @@ def run_panel_update_task(trigger, lock_owner):
                 steps_done=done,
                 progress_pct=min(92, int((done / total_steps) * 100)),
             )
+
+        after_rev = detect_app_revision(app_dir)
+        append_panel_update_log(f"更新后版本: {after_rev}")
+        if before_rev == after_rev:
+            append_panel_update_log("提示: 代码版本未变化（可能已是最新版本）")
 
         done += 1
         touch_panel_update_lock(lock_owner)

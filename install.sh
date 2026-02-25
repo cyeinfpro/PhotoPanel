@@ -530,26 +530,30 @@ uninstall_panel() {
   echo "卸载完成"
 }
 
-print_header
-echo "请选择操作:"
-echo "1) 安装面板"
-echo "2) 更新面板"
-echo "3) 卸载面板"
-echo
-read -r -p "输入选项 [1/2/3]: " action
+action="${1:-}"
+if [[ -z "${action}" ]]; then
+  print_header
+  echo "请选择操作:"
+  echo "1) 安装面板"
+  echo "2) 更新面板"
+  echo "3) 卸载面板"
+  echo
+  read -r -p "输入选项 [1/2/3]: " action
+fi
 
 case "${action}" in
-  1)
+  1|install|Install|INSTALL)
     install_panel
     ;;
-  2)
+  2|update|Update|UPDATE)
     update_panel
     ;;
-  3)
+  3|uninstall|remove|Uninstall|UNINSTALL|REMOVE)
     uninstall_panel
     ;;
   *)
     echo "无效选项: ${action}"
+    echo "可用参数: 1|install, 2|update, 3|uninstall"
     exit 1
     ;;
 esac
