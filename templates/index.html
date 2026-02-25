@@ -299,13 +299,13 @@ body {
 }
 
 .photo-masonry {
-  column-count: 5;
-  column-gap: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+  align-items: start;
 }
 
 .photo-tile {
-  break-inside: avoid;
-  margin-bottom: 12px;
   border: 1px solid var(--line);
   border-radius: 14px;
   overflow: hidden;
@@ -313,6 +313,9 @@ body {
   box-shadow: var(--shadow-card);
   cursor: pointer;
   transition: transform .18s ease, box-shadow .18s ease;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 .photo-tile:hover {
@@ -323,13 +326,58 @@ body {
 .photo-frame {
   background: linear-gradient(145deg, #f3f8ff, #fbfcff);
   border-bottom: 1px solid var(--line);
+  aspect-ratio: 4 / 3;
+  min-height: 150px;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .photo-frame img {
   width: 100%;
-  height: auto;
+  height: 100%;
   display: block;
   object-fit: contain;
+  object-position: center center;
+}
+
+.photo-frame.loading img {
+  opacity: 0;
+}
+
+.photo-frame.loading::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    110deg,
+    rgba(255, 255, 255, 0.04) 8%,
+    rgba(255, 255, 255, 0.3) 18%,
+    rgba(255, 255, 255, 0.04) 33%
+  );
+  transform: translateX(-100%);
+  animation: photo-shimmer 1.3s ease-in-out infinite;
+}
+
+.photo-frame.failed::after {
+  content: "缩略图加载失败";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  color: #7f8da5;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.photo-frame.failed img {
+  display: none;
+}
+
+@keyframes photo-shimmer {
+  100% { transform: translateX(100%); }
 }
 
 .photo-meta {
@@ -488,11 +536,11 @@ body {
 .lb-nav.next { right: 12px; }
 
 @media (max-width: 1400px) {
-  .photo-masonry { column-count: 4; }
+  .photo-masonry { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
 }
 
 @media (max-width: 1100px) {
-  .photo-masonry { column-count: 3; }
+  .photo-masonry { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
 }
 
 @media (max-width: 820px) {
@@ -501,12 +549,12 @@ body {
   .panel { padding: 13px; }
   .title { font-size: 23px; }
   .search { width: min(190px, 56vw); }
-  .photo-masonry { column-count: 2; }
+  .photo-masonry { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
 }
 
 @media (max-width: 560px) {
   .controls { gap: 7px; }
-  .photo-masonry { column-count: 1; }
+  .photo-masonry { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -722,10 +770,44 @@ function previewUrl(photo) {
   return `/api/preview/${photo.id}${suffix}`;
 }
 
+function thumbUrl(photo) {
+  const mtime = Number(photo?.mtime || 0);
+  const suffix = mtime > 0 ? `?v=${Math.floor(mtime)}` : '';
+  return `/api/thumb/${photo.id}${suffix}`;
+}
+
 function fallbackOriginalUrl(photo) {
   const mtime = Number(photo?.mtime || 0);
   const suffix = mtime > 0 ? `&v=${Math.floor(mtime)}` : '';
   return `/api/download/${photo.id}?inline=1${suffix}`;
+}
+
+function bindTileImage(img, photo) {
+  const frame = img?.closest('.photo-frame');
+  if (!frame || !photo) return;
+  let attempt = 0;
+  const sources = [thumbUrl(photo), previewUrl(photo)];
+
+  const setSource = () => {
+    if (attempt >= sources.length) {
+      frame.classList.remove('loading');
+      frame.classList.add('failed');
+      return;
+    }
+    frame.classList.add('loading');
+    frame.classList.remove('failed');
+    img.src = sources[attempt];
+    attempt += 1;
+  };
+
+  img.onload = () => {
+    frame.classList.remove('loading');
+    frame.classList.remove('failed');
+  };
+  img.onerror = () => {
+    setSource();
+  };
+  setSource();
 }
 
 function openYearFromEl(el) {
@@ -864,7 +946,7 @@ async function loadPhotoPage(reset = false) {
     state.hasMore = !!data.has_more;
     state.albumName = data.album?.name || state.albumName;
 
-    setTitle(state.albumName || '相册', `${data.total} 张照片（原比例展示）`);
+    setTitle(state.albumName || '相册', `${data.total} 张照片（网格展示）`);
     updateBreadcrumb();
 
     const grid = qs('photo-grid');
@@ -874,13 +956,15 @@ async function loadPhotoPage(reset = false) {
       tile.onclick = () => openLightboxById(p.id);
       tile.innerHTML = `
         <div class="photo-frame">
-          <img loading="lazy" decoding="async" src="/api/thumb/${p.id}" alt="${escapeHtml(p.filename)}">
+          <img loading="lazy" decoding="async" alt="${escapeHtml(p.filename)}">
         </div>
         <div class="photo-meta">
           <div class="photo-filename">${escapeHtml(p.filename)}</div>
           <div class="photo-size">${Number(p.size_mb).toFixed(2)} MB</div>
         </div>
       `;
+      const img = tile.querySelector('img');
+      bindTileImage(img, p);
       grid.appendChild(tile);
     }
 
