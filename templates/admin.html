@@ -367,7 +367,8 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
       <label style="display:flex;align-items:center;gap:8px;color:var(--text);margin:0;">
         <input type="checkbox" id="scan_force" style="width:auto;min-height:auto;"> 强制全量重建（忽略目录 mtime）
       </label>
-      <div style="text-align:right;">
+      <div style="text-align:right;display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;">
+        <button class="btn" id="transcode-detail-btn" onclick="openTranscodeModal()">转码详情</button>
         <button class="btn warn" id="start-scan-btn" onclick="startScan()">启动扫描</button>
       </div>
     </div>
@@ -515,16 +516,42 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
   </div>
 </div>
 
+<div class="modal-mask" id="transcode-modal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <div class="modal-title">转码详情 (thumb + preview)</div>
+      <button class="btn" id="transcode-close-btn" onclick="closeTranscodeModal()">关闭</button>
+    </div>
+    <div class="muted" id="transcode-stage-text">等待任务...</div>
+    <div style="height:8px"></div>
+    <div class="progress-track">
+      <div class="progress-fill" id="transcode-modal-progress-fill"></div>
+    </div>
+    <div style="height:6px"></div>
+    <div class="muted" id="transcode-modal-progress-text">0% · 0/0</div>
+    <div style="height:8px"></div>
+    <div class="muted" id="transcode-current-file">当前/最近文件: -</div>
+    <pre class="update-log" id="transcode-log">暂无记录</pre>
+  </div>
+</div>
+
 <script>
 const state = {
   users: [],
   albums: [],
   selectedAlbumId: null,
   selectedAlbumName: '',
+  lastScanRunToken: '',
+  transcodeAutoShownRun: '',
+  transcodeModalManuallyClosed: false,
   updatePollTimer: null,
   updateReloadTimer: null,
   updateReloadScheduled: false,
+  updateSawRunning: false,
 };
+
+const UPDATE_RELOAD_PENDING_KEY = 'photopanel_update_reload_pending';
+const UPDATE_RELOAD_DONE_KEY = 'photopanel_update_reload_done';
 
 function qs(id) { return document.getElementById(id); }
 
@@ -675,8 +702,66 @@ function closeUpdateModal() {
   qs('update-modal').classList.remove('show');
 }
 
+function openTranscodeModal() {
+  qs('transcode-modal').classList.add('show');
+  state.transcodeModalManuallyClosed = false;
+}
+
+function closeTranscodeModal() {
+  qs('transcode-modal').classList.remove('show');
+  state.transcodeModalManuallyClosed = true;
+}
+
+function hasUpdateReloadPending() {
+  try {
+    return sessionStorage.getItem(UPDATE_RELOAD_PENDING_KEY) === '1';
+  } catch (_e) {
+    return false;
+  }
+}
+
+function setUpdateReloadPending() {
+  try {
+    sessionStorage.setItem(UPDATE_RELOAD_PENDING_KEY, '1');
+  } catch (_e) {}
+}
+
+function clearUpdateReloadPending() {
+  try {
+    sessionStorage.removeItem(UPDATE_RELOAD_PENDING_KEY);
+  } catch (_e) {}
+}
+
+function getUpdateRunToken(s) {
+  const started = Number(s?.started_at || 0);
+  const finished = Number(s?.finished_at || 0);
+  const updated = Number(s?.updated_at || 0);
+  return `${started}:${finished || updated}`;
+}
+
+function shouldAutoReloadForCompleted(s) {
+  const fromCurrentSession = state.updateSawRunning || hasUpdateReloadPending();
+  if (!fromCurrentSession) return false;
+
+  const token = getUpdateRunToken(s);
+  if (!token || token === '0:0') return false;
+
+  try {
+    if (sessionStorage.getItem(UPDATE_RELOAD_DONE_KEY) === token) {
+      clearUpdateReloadPending();
+      return false;
+    }
+    sessionStorage.setItem(UPDATE_RELOAD_DONE_KEY, token);
+  } catch (_e) {}
+
+  clearUpdateReloadPending();
+  state.updateSawRunning = false;
+  return true;
+}
+
 function renderPanelUpdateStatus(s) {
   const running = !!s.running;
+  if (running) state.updateSawRunning = true;
   qs('update-close-btn').dataset.running = running ? '1' : '0';
   qs('update-close-btn').disabled = running;
   if (qs('panel-update-btn')) qs('panel-update-btn').disabled = running;
@@ -701,13 +786,19 @@ function renderPanelUpdateStatus(s) {
 
   if (!running) {
     stopUpdatePolling();
-    if (message === 'completed' && !state.updateReloadScheduled) {
-      state.updateReloadScheduled = true;
-      qs('update-stage-text').textContent = '更新完成，正在刷新面板...';
-      state.updateReloadTimer = setTimeout(() => {
-        window.location.reload();
-      }, 1800);
+    if (message === 'completed') {
+      const shouldReload = shouldAutoReloadForCompleted(s);
+      if (shouldReload && !state.updateReloadScheduled) {
+        state.updateReloadScheduled = true;
+        qs('update-stage-text').textContent = '更新完成，正在刷新面板...';
+        state.updateReloadTimer = setTimeout(() => {
+          window.location.reload();
+        }, 1800);
+      } else if (!state.updateReloadScheduled) {
+        qs('update-stage-text').textContent = '更新完成';
+      }
     } else if (message === 'failed') {
+      clearUpdateReloadPending();
       const err = s.error ? `，错误: ${s.error}` : '';
       qs('update-stage-text').textContent = `更新失败${err}`;
     }
@@ -734,11 +825,13 @@ async function startPanelUpdate() {
 
   const btn = qs('panel-update-btn');
   if (btn) btn.disabled = true;
+  setUpdateReloadPending();
   if (state.updateReloadTimer) {
     clearTimeout(state.updateReloadTimer);
     state.updateReloadTimer = null;
   }
   state.updateReloadScheduled = false;
+  state.updateSawRunning = false;
 
   openUpdateModal();
   qs('update-stage-text').textContent = '正在启动更新任务...';
@@ -761,6 +854,7 @@ async function startPanelUpdate() {
       await loadPanelUpdateStatus().catch(() => {});
       startUpdatePolling();
     } else {
+      clearUpdateReloadPending();
       qs('update-stage-text').textContent = `更新启动失败: ${msg}`;
       qs('update-close-btn').disabled = false;
       qs('update-close-btn').dataset.running = '0';
@@ -978,6 +1072,7 @@ async function saveAcl() {
 async function startScan() {
   const btn = qs('start-scan-btn');
   if (btn) btn.disabled = true;
+  state.transcodeModalManuallyClosed = false;
   try {
     const years = qs('scan_years').value
       .split(/[,\uFF0C]/)
@@ -1021,6 +1116,50 @@ function setProgress(fillId, textId, done, total, pct) {
   qs(textId).textContent = `${safeDone} / ${safeTotal} · ${safePct}%`;
 }
 
+function renderTranscodeModal(s, transDone, transTotal, transPct) {
+  const running = !!s.running;
+  let stageText = '当前无转码队列';
+  if (running && transTotal > 0) {
+    stageText = '转码任务运行中';
+  } else if (!running && transTotal > 0) {
+    stageText = '转码任务已结束';
+  }
+  qs('transcode-stage-text').textContent = stageText;
+  qs('transcode-modal-progress-fill').style.width = `${clampPct(transPct)}%`;
+  qs('transcode-modal-progress-text').textContent = `${clampPct(transPct)}% · ${transDone}/${transTotal}`;
+
+  const currentFile = String(s.current_cache_file || '').trim();
+  qs('transcode-current-file').textContent = `当前/最近文件: ${currentFile || (running ? '等待分配...' : '-')}`;
+
+  const logEl = qs('transcode-log');
+  const logs = Array.isArray(s.recent_cache_items) && s.recent_cache_items.length
+    ? s.recent_cache_items.join('\n')
+    : '暂无记录';
+  const nearBottom = (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 36;
+  logEl.textContent = logs;
+  if (nearBottom) logEl.scrollTop = logEl.scrollHeight;
+}
+
+function syncTranscodeModalAutoOpen(s, transTotal) {
+  const runToken = String(s.started_at || '');
+  if (runToken && runToken !== state.lastScanRunToken) {
+    state.lastScanRunToken = runToken;
+    state.transcodeAutoShownRun = '';
+    state.transcodeModalManuallyClosed = false;
+  }
+
+  if (
+    s.running &&
+    transTotal > 0 &&
+    runToken &&
+    state.transcodeAutoShownRun !== runToken &&
+    !state.transcodeModalManuallyClosed
+  ) {
+    openTranscodeModal();
+    state.transcodeAutoShownRun = runToken;
+  }
+}
+
 async function loadScanStatus() {
   const s = await api('/api/admin/scan-status');
 
@@ -1033,6 +1172,8 @@ async function loadScanStatus() {
   const transDone = s.transcode_done_tasks || s.completed_cache_tasks || 0;
   const transPct = s.transcode_progress_pct || 0;
   setProgress('transcode-progress-fill', 'transcode-progress-text', transDone, transTotal, transPct);
+  renderTranscodeModal(s, transDone, transTotal, transPct);
+  syncTranscodeModalAutoOpen(s, transTotal);
 
   const lines = [];
   lines.push(`状态: ${scanMessageText(s.message || 'unknown')}${s.running ? ' (running)' : ''}`);
@@ -1074,7 +1215,8 @@ async function init() {
 
   try {
     const updateStatus = await api('/api/admin/panel-update/status');
-    if (updateStatus.running || updateStatus.message === 'failed' || updateStatus.message === 'completed') {
+    const shouldShowCompleted = updateStatus.message === 'completed' && hasUpdateReloadPending();
+    if (updateStatus.running || updateStatus.message === 'failed' || shouldShowCompleted) {
       openUpdateModal();
       renderPanelUpdateStatus(updateStatus);
       if (updateStatus.running) startUpdatePolling();
@@ -1083,7 +1225,7 @@ async function init() {
 
   setInterval(() => {
     loadScanStatus().catch(() => {});
-  }, 5000);
+  }, 1500);
 }
 
 init();

@@ -125,6 +125,7 @@ RUNTIME_SETTINGS_CACHE_TTL = float(os.environ.get("SETTINGS_CACHE_TTL_SECONDS", 
 SCAN_LOCK_STALE_SECONDS = int(os.environ.get("SCAN_LOCK_STALE_SECONDS", "21600"))
 PANEL_UPDATE_LOCK_STALE_SECONDS = int(os.environ.get("PANEL_UPDATE_LOCK_STALE_SECONDS", "7200"))
 PANEL_UPDATE_LOG_LIMIT = int(os.environ.get("PANEL_UPDATE_LOG_LIMIT", "220"))
+PANEL_UPDATE_TERMINAL_TTL_SECONDS = int(os.environ.get("PANEL_UPDATE_TERMINAL_TTL_SECONDS", "6"))
 
 RUNTIME_SCAN_STATUS_KEY = "scan_status_json"
 RUNTIME_SCAN_LOCK_KEY = "scan_lock_json"
@@ -148,6 +149,8 @@ DEFAULT_SCAN_STATUS = {
     "scan_target_albums": 0,
     "total_cache_tasks": 0,
     "completed_cache_tasks": 0,
+    "current_cache_file": "",
+    "recent_cache_items": [],
     "stop_reason": None,
     "summary": {},
 }
@@ -1306,6 +1309,7 @@ def index_single_album(conn, album_id, album_path, album_rel_path, allowed_exts,
 def preheat_worker(task):
     photo_id, rel_path, src_mtime = task
     generated = False
+    error = ""
     try:
         _, g1 = ensure_cached_variant(rel_path, src_mtime, "thumb")
         _, g2 = ensure_cached_variant(rel_path, src_mtime, "preview")
@@ -1313,7 +1317,8 @@ def preheat_worker(task):
     except Exception as exc:
         logger.warning("Preheat failed for %s: %s", rel_path, exc)
         generated = False
-    return photo_id, src_mtime, generated
+        error = str(exc)
+    return photo_id, rel_path, src_mtime, generated, error
 
 
 def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lock_owner=None):
@@ -1350,6 +1355,8 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
         scan_target_albums=0,
         total_cache_tasks=0,
         completed_cache_tasks=0,
+        current_cache_file="",
+        recent_cache_items=[],
         stop_reason=None,
         summary={},
     )
@@ -1391,6 +1398,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
         cache_tasks = []
         queued_photo_ids = set()
         cache_budget = max_new_thumbs
+        recent_cache_items = []
         manual_selected_mode = trigger == "manual" and bool(album_filter)
 
         with get_db_conn() as conn:
@@ -1483,7 +1491,12 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
             # 1) default: changed photos in published albums
             # 2) manual targeted scan: selected albums can warm cache regardless
             #    of publish state and change flag
-            set_scan_status(total_cache_tasks=len(cache_tasks), completed_cache_tasks=0)
+            set_scan_status(
+                total_cache_tasks=len(cache_tasks),
+                completed_cache_tasks=0,
+                current_cache_file="",
+                recent_cache_items=[],
+            )
             if cache_tasks and time.time() - start < time_budget:
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     futures = [pool.submit(preheat_worker, t) for t in cache_tasks]
@@ -1493,20 +1506,30 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                         if time.time() - start >= time_budget:
                             stop_reason = stop_reason or "time_budget_seconds"
                             break
-                        photo_id, src_mtime, generated = fut.result()
+                        photo_id, rel_path, src_mtime, generated, cache_err = fut.result()
                         completed_cache_tasks += 1
                         if generated:
                             generated_cache_pairs += 1
                         # whether generated or not, cache is now expected to be valid
                         update_photo_cache_marker(photo_id, src_mtime, "thumb", conn=conn)
                         update_photo_cache_marker(photo_id, src_mtime, "preview", conn=conn)
+                        if cache_err:
+                            recent_cache_items.append(f"[失败] {rel_path} ({cache_err})")
+                        elif generated:
+                            recent_cache_items.append(f"[生成] {rel_path}")
+                        else:
+                            recent_cache_items.append(f"[命中] {rel_path}")
+                        if len(recent_cache_items) > 80:
+                            recent_cache_items = recent_cache_items[-80:]
 
                         if completed_cache_tasks % 10 == 0 or completed_cache_tasks == len(cache_tasks):
                             conn.commit()
-                            set_scan_status(
-                                generated_cache_pairs=generated_cache_pairs,
-                                completed_cache_tasks=completed_cache_tasks,
-                            )
+                        set_scan_status(
+                            generated_cache_pairs=generated_cache_pairs,
+                            completed_cache_tasks=completed_cache_tasks,
+                            current_cache_file=rel_path,
+                            recent_cache_items=recent_cache_items,
+                        )
 
                 conn.commit()
 
@@ -1554,6 +1577,8 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
             scan_target_albums=scan_target_albums,
             total_cache_tasks=len(cache_tasks),
             completed_cache_tasks=completed_cache_tasks,
+            current_cache_file="",
+            recent_cache_items=recent_cache_items,
             stop_reason=stop_reason,
             summary=summary,
         )
@@ -1566,6 +1591,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
             running=False,
             finished_at=int(time.time()),
             message="failed",
+            current_cache_file="",
             stop_reason="exception",
             summary=summary,
         )
@@ -2385,7 +2411,28 @@ def admin_scan_albums():
 @app.route("/api/admin/panel-update/status")
 @admin_required
 def admin_panel_update_status():
-    return jsonify(snapshot_panel_update_status())
+    status = snapshot_panel_update_status()
+    if not status.get("running"):
+        message = str(status.get("message") or "")
+        finished_at = int(status.get("finished_at") or 0)
+        if (
+            message in {"completed", "failed"}
+            and finished_at > 0
+            and now_ts() - finished_at >= PANEL_UPDATE_TERMINAL_TTL_SECONDS
+        ):
+            # Prevent stale terminal status from repeatedly triggering
+            # frontend auto-actions after page refresh.
+            set_panel_update_status(
+                message="idle",
+                stage="idle",
+                current_step="",
+                progress_pct=0,
+                steps_total=0,
+                steps_done=0,
+                needs_reload=False,
+            )
+            status = snapshot_panel_update_status()
+    return jsonify(status)
 
 
 @app.route("/api/admin/panel-update/start", methods=["POST"])
