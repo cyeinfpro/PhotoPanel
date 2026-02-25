@@ -125,6 +125,7 @@ runtime_settings_cache = None
 runtime_settings_cache_expires_at = 0.0
 RUNTIME_SETTINGS_CACHE_TTL = float(os.environ.get("SETTINGS_CACHE_TTL_SECONDS", "5"))
 SCAN_LOCK_STALE_SECONDS = int(os.environ.get("SCAN_LOCK_STALE_SECONDS", "21600"))
+SCAN_ABORT_FORCE_SECONDS = int(os.environ.get("SCAN_ABORT_FORCE_SECONDS", "8"))
 PANEL_UPDATE_LOCK_STALE_SECONDS = int(os.environ.get("PANEL_UPDATE_LOCK_STALE_SECONDS", "7200"))
 PANEL_UPDATE_LOG_LIMIT = int(os.environ.get("PANEL_UPDATE_LOG_LIMIT", "220"))
 PANEL_UPDATE_TERMINAL_TTL_SECONDS = int(os.environ.get("PANEL_UPDATE_TERMINAL_TTL_SECONDS", "6"))
@@ -2693,6 +2694,23 @@ def admin_scan_status():
     status["abort_requested"] = bool(control_state.get("abort_requested")) or bool(
         status.get("abort_requested")
     )
+
+    if status.get("running") and status["abort_requested"]:
+        abort_requested_at = int(control_state.get("updated_at") or 0)
+        if abort_requested_at <= 0:
+            abort_requested_at = int(status.get("started_at") or 0)
+        if abort_requested_at > 0 and (now_ts() - abort_requested_at) >= max(2, SCAN_ABORT_FORCE_SECONDS):
+            logger.warning("Abort request timed out, forcing scan runtime finish.")
+            force_finish_scan_runtime("aborted_by_user_forced")
+            status = snapshot_scan_status()
+            lock_state = get_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, DEFAULT_LOCK_STATE)
+            control_state = get_json_runtime_state(RUNTIME_SCAN_CONTROL_KEY, DEFAULT_SCAN_CONTROL)
+            status["pause_requested"] = bool(control_state.get("pause_requested")) or bool(
+                status.get("pause_requested")
+            )
+            status["abort_requested"] = bool(control_state.get("abort_requested")) or bool(
+                status.get("abort_requested")
+            )
 
     if status.get("running"):
         if status["abort_requested"]:

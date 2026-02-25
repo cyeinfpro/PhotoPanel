@@ -1124,10 +1124,10 @@ function setScanControlButtons(s) {
     resumeBtn.textContent = busyAction === 'resume' ? '继续中...' : '继续任务';
   }
   if (abortBtn) {
-    abortBtn.disabled = !running || abortRequested || !!busyAction;
+    abortBtn.disabled = !running || !!busyAction;
     abortBtn.textContent = busyAction === 'abort'
       ? '中断请求中...'
-      : (abortRequested ? '中断中...' : '中断任务');
+      : (abortRequested ? '强制中断' : '中断任务');
   }
 }
 
@@ -1163,7 +1163,11 @@ async function resumeScan() {
 }
 
 async function abortScan() {
-  if (!confirm('确认中断当前扫描与转码任务？该操作不可恢复。')) return;
+  const aborting = (qs('abort-scan-btn')?.textContent || '').includes('强制');
+  const msg = aborting
+    ? '任务仍未停止，是否执行强制中断并回收卡住状态？'
+    : '确认中断当前扫描与转码任务？该操作不可恢复。';
+  if (!confirm(msg)) return;
   await sendScanControl('abort');
 }
 
