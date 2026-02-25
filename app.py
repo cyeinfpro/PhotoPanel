@@ -17,7 +17,7 @@ import subprocess
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from functools import wraps
 from pathlib import Path
 
@@ -1201,7 +1201,15 @@ def upsert_album(conn, year, name, rel_path, dir_mtime):
     return cur.lastrowid, False, 0
 
 
-def index_single_album(conn, album_id, album_path, album_rel_path, allowed_exts, max_files_per_album):
+def index_single_album(
+    conn,
+    album_id,
+    album_path,
+    album_rel_path,
+    allowed_exts,
+    max_files_per_album,
+    exclude_dirs=None,
+):
     existing_rows = conn.execute(
         "SELECT id, rel_path, mtime, size FROM photos WHERE album_id = ?",
         (album_id,),
@@ -1213,69 +1221,80 @@ def index_single_album(conn, album_id, album_path, album_rel_path, allowed_exts,
     scanned_files = 0
     updated_files = 0
 
-    try:
-        files = sorted(os.listdir(album_path))
-    except FileNotFoundError:
-        files = []
+    excluded_names = {str(v).strip().lower() for v in (exclude_dirs or []) if str(v).strip()}
 
-    for name in files:
+    for root, dirnames, filenames in os.walk(album_path, topdown=True):
+        dirnames[:] = [
+            d
+            for d in sorted(dirnames)
+            if not is_hidden_name(d) and d.strip().lower() not in excluded_names
+        ]
+
+        for name in sorted(filenames):
+            if scanned_files >= max_files_per_album:
+                break
+            if is_hidden_name(name):
+                continue
+
+            ext = Path(name).suffix.lower()
+            if ext not in allowed_exts:
+                continue
+
+            full = Path(root) / name
+            if not full.is_file():
+                continue
+
+            try:
+                rel_inside = full.relative_to(album_path).as_posix()
+            except ValueError:
+                continue
+            rel = f"{album_rel_path}/{rel_inside}"
+
+            try:
+                stat = full.stat()
+                src_mtime = stat.st_mtime
+                src_size = stat.st_size
+            except OSError:
+                continue
+
+            scanned_files += 1
+            seen_paths.add(rel)
+
+            old = existing.get(rel)
+            photo_id = None
+            changed = False
+
+            if old:
+                photo_id = old["id"]
+                if old["mtime"] != src_mtime or old["size"] != src_size:
+                    changed = True
+                    conn.execute(
+                        """
+                        UPDATE photos
+                        SET filename = ?, mtime = ?, size = ?, ext = ?, indexed_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (name, src_mtime, src_size, ext, photo_id),
+                    )
+            else:
+                changed = True
+                cur = conn.execute(
+                    """
+                    INSERT INTO photos(album_id, rel_path, filename, mtime, size, ext, indexed_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    (album_id, rel, name, src_mtime, src_size, ext),
+                )
+                photo_id = cur.lastrowid
+
+            if changed:
+                updated_files += 1
+
+            sorted_photo_items.append((rel_inside, photo_id, rel, src_mtime, changed))
+
         if scanned_files >= max_files_per_album:
             break
-        if is_hidden_name(name):
-            continue
-
-        ext = Path(name).suffix.lower()
-        if ext not in allowed_exts:
-            continue
-
-        full = album_path / name
-        if not full.is_file():
-            continue
-
-        rel = f"{album_rel_path}/{name}"
-
-        try:
-            stat = full.stat()
-            src_mtime = stat.st_mtime
-            src_size = stat.st_size
-        except OSError:
-            continue
-
-        scanned_files += 1
-        seen_paths.add(rel)
-
-        old = existing.get(rel)
-        photo_id = None
-        changed = False
-
-        if old:
-            photo_id = old["id"]
-            if old["mtime"] != src_mtime or old["size"] != src_size:
-                changed = True
-                conn.execute(
-                    """
-                    UPDATE photos
-                    SET filename = ?, mtime = ?, size = ?, ext = ?, indexed_at = CURRENT_TIMESTAMP,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (name, src_mtime, src_size, ext, photo_id),
-                )
-        else:
-            changed = True
-            cur = conn.execute(
-                """
-                INSERT INTO photos(album_id, rel_path, filename, mtime, size, ext, indexed_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """,
-                (album_id, rel, name, src_mtime, src_size, ext),
-            )
-            photo_id = cur.lastrowid
-
-        if changed:
-            updated_files += 1
-
-        sorted_photo_items.append((name, photo_id, rel, src_mtime, changed))
 
     deleted_files = 0
     for rel, row in existing.items():
@@ -1450,6 +1469,7 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                     rel_path,
                     allowed_exts,
                     max_files_per_album,
+                    exclude_dirs=exclude_dirs,
                 )
 
                 processed_albums += 1
@@ -1495,47 +1515,104 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
             # 1) default: changed photos in published albums
             # 2) manual targeted scan: selected albums can warm cache regardless
             #    of publish state and change flag
+            queue_preview = [t[1] for t in cache_tasks[:8]]
+            recent_cache_items = [f"[排队] {p}" for p in queue_preview]
+            current_cache_file = queue_preview[0] if queue_preview else ""
             set_scan_status(
                 total_cache_tasks=len(cache_tasks),
                 completed_cache_tasks=0,
-                current_cache_file="",
-                recent_cache_items=[],
+                current_cache_file=current_cache_file,
+                recent_cache_items=recent_cache_items,
             )
             if cache_tasks and time.time() - start < time_budget:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [pool.submit(preheat_worker, t) for t in cache_tasks]
-                    for fut in as_completed(futures):
-                        if lock_owner and completed_cache_tasks % 8 == 0:
+                pool = ThreadPoolExecutor(max_workers=workers)
+                future_to_task = {}
+                try:
+                    for task in cache_tasks:
+                        fut = pool.submit(preheat_worker, task)
+                        future_to_task[fut] = task
+
+                    last_status_push = 0.0
+                    last_done_ts = time.time()
+                    stall_notice_added = False
+
+                    while future_to_task:
+                        if lock_owner:
                             touch_scan_lock(lock_owner)
                         if time.time() - start >= time_budget:
                             stop_reason = stop_reason or "time_budget_seconds"
                             break
-                        photo_id, rel_path, src_mtime, generated, cache_err = fut.result()
-                        completed_cache_tasks += 1
-                        if generated:
-                            generated_cache_pairs += 1
-                        # whether generated or not, cache is now expected to be valid
-                        update_photo_cache_marker(photo_id, src_mtime, "thumb", conn=conn)
-                        update_photo_cache_marker(photo_id, src_mtime, "preview", conn=conn)
-                        if cache_err:
-                            recent_cache_items.append(f"[失败] {rel_path} ({cache_err})")
-                        elif generated:
-                            recent_cache_items.append(f"[生成] {rel_path}")
-                        else:
-                            recent_cache_items.append(f"[命中] {rel_path}")
-                        if len(recent_cache_items) > 80:
-                            recent_cache_items = recent_cache_items[-80:]
 
-                        if completed_cache_tasks % 10 == 0 or completed_cache_tasks == len(cache_tasks):
-                            conn.commit()
-                        set_scan_status(
-                            generated_cache_pairs=generated_cache_pairs,
-                            completed_cache_tasks=completed_cache_tasks,
-                            current_cache_file=rel_path,
-                            recent_cache_items=recent_cache_items,
+                        done, _ = wait(
+                            tuple(future_to_task.keys()),
+                            timeout=1.0,
+                            return_when=FIRST_COMPLETED,
                         )
+                        if not done:
+                            now = time.time()
+                            pending_task = next(iter(future_to_task.values()), None)
+                            if pending_task:
+                                current_cache_file = pending_task[1]
+                            if now - last_done_ts >= 20 and not stall_notice_added:
+                                recent_cache_items.append("[等待] 转码较慢，可能受 SMB 读写速度影响")
+                                stall_notice_added = True
+                            if now - last_status_push >= 2.0:
+                                if len(recent_cache_items) > 80:
+                                    recent_cache_items = recent_cache_items[-80:]
+                                set_scan_status(
+                                    generated_cache_pairs=generated_cache_pairs,
+                                    completed_cache_tasks=completed_cache_tasks,
+                                    current_cache_file=current_cache_file,
+                                    recent_cache_items=recent_cache_items,
+                                )
+                                last_status_push = now
+                            continue
 
-                conn.commit()
+                        for fut in done:
+                            task = future_to_task.pop(fut, None)
+                            if task is None:
+                                continue
+                            try:
+                                photo_id, rel_path, src_mtime, generated, cache_err = fut.result()
+                            except Exception as exc:
+                                photo_id, rel_path, src_mtime = task
+                                generated = False
+                                cache_err = str(exc)
+
+                            completed_cache_tasks += 1
+                            last_done_ts = time.time()
+                            stall_notice_added = False
+                            current_cache_file = rel_path
+                            if generated:
+                                generated_cache_pairs += 1
+                            # whether generated or not, cache is now expected to be valid
+                            update_photo_cache_marker(photo_id, src_mtime, "thumb", conn=conn)
+                            update_photo_cache_marker(photo_id, src_mtime, "preview", conn=conn)
+                            if cache_err:
+                                recent_cache_items.append(f"[失败] {rel_path} ({cache_err})")
+                            elif generated:
+                                recent_cache_items.append(f"[生成] {rel_path}")
+                            else:
+                                recent_cache_items.append(f"[命中] {rel_path}")
+                            if len(recent_cache_items) > 80:
+                                recent_cache_items = recent_cache_items[-80:]
+
+                            if completed_cache_tasks % 10 == 0 or completed_cache_tasks == len(cache_tasks):
+                                conn.commit()
+                            set_scan_status(
+                                generated_cache_pairs=generated_cache_pairs,
+                                completed_cache_tasks=completed_cache_tasks,
+                                current_cache_file=current_cache_file,
+                                recent_cache_items=recent_cache_items,
+                            )
+                    conn.commit()
+                finally:
+                    if stop_reason == "time_budget_seconds" and future_to_task:
+                        for fut in future_to_task:
+                            fut.cancel()
+                        pool.shutdown(wait=False, cancel_futures=True)
+                    else:
+                        pool.shutdown(wait=True)
 
         duration = round(time.time() - start, 2)
         summary.update(
