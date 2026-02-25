@@ -330,6 +330,8 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  content-visibility: auto;
+  contain-intrinsic-size: 320px 300px;
 }
 
 .photo-tile:hover {
@@ -657,13 +659,43 @@ const state = {
   albums: [],
   photos: [],
   page: 1,
-  pageSize: 120,
+  pageSize: 72,
   hasMore: false,
   loading: false,
   query: '',
   lightboxIndex: -1,
   lightboxRenderToken: '',
 };
+
+const MAX_PARALLEL_IMAGE_REQUESTS = Math.max(
+  4,
+  Math.min(12, Math.floor((navigator.hardwareConcurrency || 8) * 0.75))
+);
+let activeImageRequests = 0;
+const pendingImageStarts = [];
+
+function pumpImageStartQueue() {
+  while (activeImageRequests < MAX_PARALLEL_IMAGE_REQUESTS && pendingImageStarts.length) {
+    const start = pendingImageStarts.shift();
+    if (typeof start === 'function') start();
+  }
+}
+
+function queueImageStart(start) {
+  pendingImageStarts.push(start);
+  pumpImageStartQueue();
+}
+
+const tileImageObserver = 'IntersectionObserver' in window
+  ? new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const img = entry.target;
+      tileImageObserver.unobserve(img);
+      queueImageStart(img.__tileStartLoad);
+    }
+  }, { rootMargin: '600px 0px', threshold: 0.01 })
+  : null;
 
 function qs(id) { return document.getElementById(id); }
 
@@ -801,34 +833,55 @@ function setLightboxStage(stage, status, text) {
   qs('lb-stage-msg').textContent = text || '';
 }
 
+function versionToken(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return String(Math.floor(numeric));
+  return encodeURIComponent(String(value));
+}
+
+function withVersion(url, value) {
+  const token = versionToken(value);
+  if (!token) return url;
+  const joiner = url.includes('?') ? '&' : '?';
+  return `${url}${joiner}v=${token}`;
+}
+
 function previewUrl(photo) {
-  const mtime = Number(photo?.mtime || 0);
-  const suffix = mtime > 0 ? `?v=${Math.floor(mtime)}` : '';
-  return `/api/preview/${photo.id}${suffix}`;
+  return withVersion(`/api/preview/${photo.id}`, photo?.mtime);
 }
 
 function thumbUrl(photo) {
-  const mtime = Number(photo?.mtime || 0);
-  const suffix = mtime > 0 ? `?v=${Math.floor(mtime)}` : '';
-  return `/api/thumb/${photo.id}${suffix}`;
+  return withVersion(`/api/thumb/${photo.id}`, photo?.mtime);
+}
+
+function thumbUrlById(photoId, mtime) {
+  return withVersion(`/api/thumb/${photoId}`, mtime);
 }
 
 function fallbackOriginalUrl(photo) {
-  const mtime = Number(photo?.mtime || 0);
-  const suffix = mtime > 0 ? `&v=${Math.floor(mtime)}` : '';
-  return `/api/download/${photo.id}?inline=1${suffix}`;
+  return withVersion(`/api/download/${photo.id}?inline=1`, photo?.mtime);
 }
 
-function bindTileImage(img, photo) {
+function bindTileImage(img, photo, eager = false) {
   const frame = img?.closest('.photo-frame');
   if (!frame || !photo) return;
   let attempt = 0;
+  let slotHeld = false;
   const sources = [thumbUrl(photo), previewUrl(photo)];
+
+  const releaseSlot = () => {
+    if (!slotHeld) return;
+    slotHeld = false;
+    activeImageRequests = Math.max(0, activeImageRequests - 1);
+    pumpImageStartQueue();
+  };
 
   const setSource = () => {
     if (attempt >= sources.length) {
       frame.classList.remove('loading');
       frame.classList.add('failed');
+      releaseSlot();
       return;
     }
     frame.classList.add('loading');
@@ -840,11 +893,32 @@ function bindTileImage(img, photo) {
   img.onload = () => {
     frame.classList.remove('loading');
     frame.classList.remove('failed');
+    releaseSlot();
   };
   img.onerror = () => {
+    if (attempt < sources.length) {
+      setSource();
+      return;
+    }
+    frame.classList.remove('loading');
+    frame.classList.add('failed');
+    releaseSlot();
+  };
+
+  const startLoad = () => {
+    if (img.dataset.loadStarted === '1') return;
+    img.dataset.loadStarted = '1';
+    slotHeld = true;
+    activeImageRequests += 1;
     setSource();
   };
-  setSource();
+
+  img.__tileStartLoad = startLoad;
+  if (eager || !tileImageObserver) {
+    queueImageStart(startLoad);
+  } else {
+    tileImageObserver.observe(img);
+  }
 }
 
 function openYearFromEl(el) {
@@ -891,7 +965,7 @@ async function openYears() {
 
   let html = '<div class="grid years">';
   for (const y of state.years) {
-    const cover = y.cover_photo_id ? `/api/thumb/${y.cover_photo_id}` : '';
+    const cover = y.cover_photo_id ? thumbUrlById(y.cover_photo_id, y.cover_photo_mtime) : '';
     const yearEncoded = encodeURIComponent(String(y.year || ''));
     html += `
       <article class="card" data-year="${yearEncoded}" onclick="openYearFromEl(this)">
@@ -935,7 +1009,7 @@ async function openYear(year) {
 
   let html = '<div class="grid albums">';
   for (const a of state.albums) {
-    const cover = `/api/cover/${a.id}`;
+    const cover = withVersion(`/api/cover/${a.id}`, a.updated_at);
     const albumNameEncoded = encodeURIComponent(String(a.name || ''));
     const publishTag = CURRENT_USER.role === 'admin'
       ? `<span class="tag" style="background:${a.published ? 'rgba(16,185,129,.86)' : 'rgba(245,158,11,.86)'};">${a.published ? '已发布' : '未发布'}</span>`
@@ -1028,7 +1102,7 @@ async function loadPhotoPage(reset = false) {
         let folderHtml = '';
         for (const f of folders) {
           const folderPathEncoded = encodeURIComponent(String(f.path || ''));
-          const cover = f.cover_photo_id ? `/api/thumb/${f.cover_photo_id}` : '';
+          const cover = f.cover_photo_id ? thumbUrlById(f.cover_photo_id, f.cover_photo_mtime) : '';
           folderHtml += `
             <article class="card folder-card" data-folder="${folderPathEncoded}" onclick="openFolderFromEl(this)">
               <div class="cover">
@@ -1047,7 +1121,10 @@ async function loadPhotoPage(reset = false) {
     }
 
     const grid = qs('photo-grid');
-    for (const p of data.photos || []) {
+    const photoBatch = Array.isArray(data.photos) ? data.photos : [];
+    const fragment = document.createDocumentFragment();
+    for (let idx = 0; idx < photoBatch.length; idx += 1) {
+      const p = photoBatch[idx];
       const tile = document.createElement('article');
       tile.className = 'photo-tile';
       tile.onclick = () => openLightboxById(p.id);
@@ -1061,9 +1138,13 @@ async function loadPhotoPage(reset = false) {
         </div>
       `;
       const img = tile.querySelector('img');
-      bindTileImage(img, p);
-      grid.appendChild(tile);
+      const eager = reset && idx < 18;
+      img.loading = eager ? 'eager' : 'lazy';
+      img.fetchPriority = eager ? 'high' : 'low';
+      bindTileImage(img, p, eager);
+      fragment.appendChild(tile);
     }
+    grid.appendChild(fragment);
 
     if (reset && Number(data.folder_count || 0) === 0 && Number(data.total || 0) === 0) {
       renderEmpty('当前目录为空');

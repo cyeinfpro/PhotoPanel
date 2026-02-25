@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 
@@ -71,6 +72,11 @@ WEBP_METHOD_DEFAULT = int(os.environ.get("WEBP_METHOD", "4"))
 ENABLE_X_ACCEL = os.environ.get("ENABLE_X_ACCEL", "0") == "1"
 ACCEL_CACHE_PREFIX = os.environ.get("ACCEL_CACHE_PREFIX", "/_cache")
 ACCEL_ORIG_PREFIX = os.environ.get("ACCEL_ORIG_PREFIX", "/_orig")
+
+CACHE_CONTROL_IMMUTABLE_PRIVATE = "private, max-age=31536000, immutable"
+CACHE_CONTROL_SHORT_PRIVATE = "private, max-age=600, stale-while-revalidate=86400"
+CACHE_CONTROL_REVALIDATE_PRIVATE = "private, max-age=0, must-revalidate"
+CACHE_CONTROL_NO_STORE_PRIVATE = "private, no-store"
 
 DEFAULT_SETTINGS = {
     "photo_root": PHOTO_ROOT_DEFAULT,
@@ -1206,22 +1212,95 @@ def update_photo_cache_marker(photo_id, src_mtime, variant, conn=None):
         conn.execute(query, (src_mtime, photo_id))
 
 
-def accel_or_send(local_path, internal_rel_path, mimetype, as_attachment=False, download_name=None):
+def choose_cache_control(cache_policy, as_attachment=False):
+    if as_attachment:
+        return CACHE_CONTROL_NO_STORE_PRIVATE
+    if cache_policy == "immutable":
+        return CACHE_CONTROL_IMMUTABLE_PRIVATE
+    if cache_policy == "short":
+        return CACHE_CONTROL_SHORT_PRIVATE
+    if cache_policy == "no-store":
+        return CACHE_CONTROL_NO_STORE_PRIVATE
+    return CACHE_CONTROL_REVALIDATE_PRIVATE
+
+
+def file_http_cache_metadata(local_path):
+    try:
+        st = Path(local_path).stat()
+    except OSError:
+        return None, None
+
+    mtime_seconds = max(0, int(st.st_mtime))
+    etag_value = f"{mtime_seconds:x}-{int(st.st_size):x}"
+    last_modified = datetime.fromtimestamp(mtime_seconds, tz=timezone.utc)
+    return etag_value, last_modified
+
+
+def request_not_modified(etag_value, last_modified):
+    if etag_value:
+        try:
+            if request.if_none_match and request.if_none_match.contains_weak(etag_value):
+                return True
+        except Exception:
+            pass
+
+    if last_modified is not None and request.if_modified_since is not None:
+        try:
+            ims = request.if_modified_since
+            if ims.tzinfo is None:
+                ims = ims.replace(tzinfo=timezone.utc)
+            if last_modified <= ims:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def set_http_cache_headers(resp, cache_control, etag_value=None, last_modified=None):
+    resp.headers["Cache-Control"] = cache_control
+    vary = resp.headers.get("Vary", "")
+    if "Accept-Encoding" not in vary:
+        resp.headers["Vary"] = f"{vary}, Accept-Encoding".strip(", ")
+    if etag_value:
+        resp.set_etag(etag_value, weak=True)
+    if last_modified is not None:
+        resp.last_modified = last_modified
+
+
+def accel_or_send(
+    local_path,
+    internal_rel_path,
+    mimetype,
+    as_attachment=False,
+    download_name=None,
+    cache_policy="revalidate",
+):
+    cache_control = choose_cache_control(cache_policy, as_attachment=as_attachment)
+    etag_value, last_modified = file_http_cache_metadata(local_path)
+
+    if request_not_modified(etag_value, last_modified):
+        resp = Response(status=304)
+        set_http_cache_headers(resp, cache_control, etag_value, last_modified)
+        return resp
+
     if ENABLE_X_ACCEL:
         resp = Response(status=200)
         resp.headers["Content-Type"] = mimetype
         if as_attachment and download_name:
             resp.headers["Content-Disposition"] = f'attachment; filename="{download_name}"'
         resp.headers["X-Accel-Redirect"] = internal_rel_path
-        return resp
+    else:
+        resp = send_file(
+            local_path,
+            mimetype=mimetype,
+            as_attachment=as_attachment,
+            download_name=download_name,
+            conditional=False,
+        )
 
-    return send_file(
-        local_path,
-        mimetype=mimetype,
-        as_attachment=as_attachment,
-        download_name=download_name,
-        max_age=86400 * 7,
-    )
+    set_http_cache_headers(resp, cache_control, etag_value, last_modified)
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -2773,9 +2852,11 @@ def api_years():
             if g.user["role"] == "admin":
                 cover = conn.execute(
                     """
-                    SELECT cover_photo_id FROM albums
-                    WHERE year = ? AND cover_photo_id IS NOT NULL
-                    ORDER BY updated_at DESC
+                    SELECT a.cover_photo_id, p.mtime AS cover_photo_mtime
+                    FROM albums a
+                    LEFT JOIN photos p ON p.id = a.cover_photo_id
+                    WHERE a.year = ? AND a.cover_photo_id IS NOT NULL
+                    ORDER BY a.updated_at DESC
                     LIMIT 1
                     """,
                     (r["year"],),
@@ -2783,9 +2864,10 @@ def api_years():
             else:
                 cover = conn.execute(
                     """
-                    SELECT a.cover_photo_id
+                    SELECT a.cover_photo_id, p.mtime AS cover_photo_mtime
                     FROM albums a
                     JOIN user_album_acl acl ON acl.album_id = a.id
+                    LEFT JOIN photos p ON p.id = a.cover_photo_id
                     WHERE a.year = ? AND a.published = 1 AND acl.user_id = ? AND a.cover_photo_id IS NOT NULL
                     ORDER BY a.updated_at DESC
                     LIMIT 1
@@ -2799,6 +2881,7 @@ def api_years():
                     "albums": r["album_count"],
                     "photos": r["photo_count"],
                     "cover_photo_id": cover["cover_photo_id"] if cover else None,
+                    "cover_photo_mtime": cover["cover_photo_mtime"] if cover else None,
                 }
             )
 
@@ -2826,15 +2909,17 @@ def api_albums():
     if g.user["role"] == "admin":
         sql = """
             SELECT a.id, a.year, a.name, a.rel_path, a.photo_count, a.published,
-                   a.cover_photo_id, a.last_indexed_at, a.updated_at
+                   a.cover_photo_id, p.mtime AS cover_photo_mtime, a.last_indexed_at, a.updated_at
             FROM albums a
+            LEFT JOIN photos p ON p.id = a.cover_photo_id
         """
     else:
         sql = """
             SELECT a.id, a.year, a.name, a.rel_path, a.photo_count, a.published,
-                   a.cover_photo_id, a.last_indexed_at, a.updated_at
+                   a.cover_photo_id, p.mtime AS cover_photo_mtime, a.last_indexed_at, a.updated_at
             FROM albums a
             JOIN user_album_acl acl ON acl.album_id = a.id
+            LEFT JOIN photos p ON p.id = a.cover_photo_id
         """
         where.append("a.published = 1")
         where.append("acl.user_id = ?")
@@ -2859,6 +2944,7 @@ def api_albums():
                 "photo_count": r["photo_count"],
                 "published": bool(r["published"]),
                 "cover_photo_id": r["cover_photo_id"],
+                "cover_photo_mtime": r["cover_photo_mtime"],
                 "last_indexed_at": r["last_indexed_at"],
                 "updated_at": r["updated_at"],
             }
@@ -2979,12 +3065,21 @@ def api_photos():
                 photo_root,
                 fallback_id=r["cover_photo_id"],
             )
+            cover_photo_mtime = None
+            if cover_photo_id:
+                cover_row = conn.execute(
+                    "SELECT mtime FROM photos WHERE id = ?",
+                    (cover_photo_id,),
+                ).fetchone()
+                if cover_row:
+                    cover_photo_mtime = cover_row["mtime"]
             folders.append(
                 {
                     "name": folder_name,
                     "path": next_path,
                     "photo_count": int(r["photo_count"] or 0),
                     "cover_photo_id": cover_photo_id,
+                    "cover_photo_mtime": cover_photo_mtime,
                 }
             )
 
@@ -3034,7 +3129,8 @@ def api_cover(album_id):
 
     rel_for_accel = f"{album['rel_path']}{CACHE_EXT}"
     internal = f"{ACCEL_CACHE_PREFIX}/cover/{rel_for_accel}"
-    return accel_or_send(local_cover, internal, "image/webp")
+    cache_policy = "immutable" if (request.args.get("v") or "").strip() else "short"
+    return accel_or_send(local_cover, internal, "image/webp", cache_policy=cache_policy)
 
 
 @app.route("/api/thumb/<int:photo_id>")
@@ -3050,7 +3146,8 @@ def api_thumb(photo_id):
 
     rel_for_accel = cache_rel_without_ext(photo["rel_path"])
     internal = f"{ACCEL_CACHE_PREFIX}/thumb/{rel_for_accel}"
-    return accel_or_send(local, internal, "image/webp")
+    cache_policy = "immutable" if (request.args.get("v") or "").strip() else "short"
+    return accel_or_send(local, internal, "image/webp", cache_policy=cache_policy)
 
 
 @app.route("/api/preview/<int:photo_id>")
@@ -3066,7 +3163,8 @@ def api_preview(photo_id):
 
     rel_for_accel = cache_rel_without_ext(photo["rel_path"])
     internal = f"{ACCEL_CACHE_PREFIX}/preview/{rel_for_accel}"
-    return accel_or_send(local, internal, "image/webp")
+    cache_policy = "immutable" if (request.args.get("v") or "").strip() else "short"
+    return accel_or_send(local, internal, "image/webp", cache_policy=cache_policy)
 
 
 @app.route("/api/download/<int:photo_id>")
@@ -3085,12 +3183,14 @@ def api_download(photo_id):
     guessed_mime, _ = mimetypes.guess_type(photo["filename"])
     mime_type = guessed_mime or "application/octet-stream"
     internal = f"{ACCEL_ORIG_PREFIX}/{photo['rel_path']}"
+    cache_policy = "short" if inline else "no-store"
     return accel_or_send(
         str(src),
         internal,
         mime_type if inline else "application/octet-stream",
         as_attachment=not inline,
         download_name=None if inline else photo["filename"],
+        cache_policy=cache_policy,
     )
 
 
