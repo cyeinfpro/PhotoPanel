@@ -1638,16 +1638,14 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                 if cache_tasks and time.time() - start < time_budget:
                     pool = ThreadPoolExecutor(max_workers=workers)
                     future_to_task = {}
+                    pending_index = 0
+                    pending_total = len(cache_tasks)
                     try:
-                        for task in cache_tasks:
-                            fut = pool.submit(preheat_worker, task)
-                            future_to_task[fut] = task
-
                         last_status_push = 0.0
                         last_done_ts = time.time()
                         stall_notice_added = False
 
-                        while future_to_task:
+                        while future_to_task or pending_index < pending_total:
                             action = check_scan_runtime_control(lock_owner, "transcoding")
                             if action == "abort":
                                 stop_reason = "aborted_by_user"
@@ -1657,6 +1655,15 @@ def run_scan_task(trigger, years_filter=None, album_filter=None, force=False, lo
                             if time.time() - start >= time_budget:
                                 stop_reason = stop_reason or "time_budget_seconds"
                                 break
+
+                            while pending_index < pending_total and len(future_to_task) < workers:
+                                task = cache_tasks[pending_index]
+                                pending_index += 1
+                                fut = pool.submit(preheat_worker, task)
+                                future_to_task[fut] = task
+
+                            if not future_to_task:
+                                continue
 
                             done, _ = wait(
                                 tuple(future_to_task.keys()),
@@ -2600,6 +2607,7 @@ def api_download(photo_id):
 def admin_scan_status():
     status = snapshot_scan_status()
     lock_state = get_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, DEFAULT_LOCK_STATE)
+    control_state = get_json_runtime_state(RUNTIME_SCAN_CONTROL_KEY, DEFAULT_SCAN_CONTROL)
 
     raw = get_setting("last_scan_summary", "")
     if raw:
@@ -2629,6 +2637,18 @@ def admin_scan_status():
     status["transcode_done_tasks"] = trans_done
     status["transcode_progress_pct"] = transcode_progress_pct
     status["scan_lock_running"] = bool(lock_state.get("running"))
+    status["pause_requested"] = bool(control_state.get("pause_requested")) or bool(
+        status.get("pause_requested")
+    )
+    status["abort_requested"] = bool(control_state.get("abort_requested")) or bool(
+        status.get("abort_requested")
+    )
+
+    if status.get("running"):
+        if status["abort_requested"]:
+            status["message"] = "aborting"
+        elif status["pause_requested"] and not status.get("paused"):
+            status["message"] = "pausing"
 
     cfg = get_runtime_settings()
     photo_root = cfg.get("photo_root", "")
@@ -2665,6 +2685,51 @@ def admin_scan_albums():
         return jsonify({"error": "scan_running"}), 409
 
     return jsonify({"ok": True, "status": "started"})
+
+
+@app.route("/api/admin/albums/scan/control", methods=["POST"])
+@admin_required
+def admin_scan_control():
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action", "")).strip().lower()
+    if action not in {"pause", "resume", "abort"}:
+        return jsonify({"error": "scan_control_invalid_action"}), 400
+
+    status = snapshot_scan_status()
+    lock_state = get_json_runtime_state(RUNTIME_SCAN_LOCK_KEY, DEFAULT_LOCK_STATE)
+    running = bool(status.get("running")) or bool(lock_state.get("running"))
+    if not running:
+        return jsonify({"error": "scan_not_running"}), 409
+
+    control = snapshot_scan_control_state()
+    paused = bool(status.get("paused"))
+    pause_requested = bool(control.get("pause_requested"))
+    abort_requested = bool(control.get("abort_requested"))
+
+    if action == "pause":
+        if abort_requested:
+            return jsonify({"error": "scan_abort_already_requested"}), 409
+        if paused or pause_requested:
+            return jsonify({"ok": True, "status": "already_pausing"})
+        update_scan_control_state(pause_requested=True, abort_requested=False)
+        set_scan_status(pause_requested=True, abort_requested=False, message="pausing")
+        return jsonify({"ok": True, "status": "pausing"})
+
+    if action == "resume":
+        if abort_requested:
+            return jsonify({"error": "scan_abort_already_requested"}), 409
+        if not paused and not pause_requested:
+            return jsonify({"error": "scan_not_paused"}), 409
+        update_scan_control_state(pause_requested=False, abort_requested=False)
+        set_scan_status(paused=False, pause_requested=False, abort_requested=False, message="running")
+        return jsonify({"ok": True, "status": "resuming"})
+
+    # action == "abort"
+    if abort_requested:
+        return jsonify({"ok": True, "status": "already_aborting"})
+    update_scan_control_state(pause_requested=False, abort_requested=True)
+    set_scan_status(paused=False, pause_requested=False, abort_requested=True, message="aborting")
+    return jsonify({"ok": True, "status": "aborting"})
 
 
 @app.route("/api/admin/panel-update/status")

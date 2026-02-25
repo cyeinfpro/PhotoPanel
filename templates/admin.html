@@ -80,6 +80,11 @@ body {
   color: #fff;
   background: linear-gradient(180deg, #f59e0b, #d97706);
 }
+.btn.danger {
+  border: none;
+  color: #fff;
+  background: linear-gradient(180deg, #ef4444, #dc2626);
+}
 .container {
   max-width: 1500px;
   margin: 0 auto;
@@ -369,6 +374,9 @@ th { background: rgba(255,255,255,.8); position: sticky; top: 0; z-index: 1; }
       </label>
       <div style="text-align:right;display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;">
         <button class="btn" id="transcode-detail-btn" onclick="openTranscodeModal()">转码详情</button>
+        <button class="btn" id="pause-scan-btn" onclick="pauseScan()">暂停任务</button>
+        <button class="btn" id="resume-scan-btn" onclick="resumeScan()">继续任务</button>
+        <button class="btn danger" id="abort-scan-btn" onclick="abortScan()">中断任务</button>
         <button class="btn warn" id="start-scan-btn" onclick="startScan()">启动扫描</button>
       </div>
     </div>
@@ -544,6 +552,7 @@ const state = {
   lastScanRunToken: '',
   transcodeAutoShownRun: '',
   transcodeModalManuallyClosed: false,
+  scanControlBusyAction: '',
   updatePollTimer: null,
   updateReloadTimer: null,
   updateReloadScheduled: false,
@@ -574,6 +583,10 @@ function normalizeApiError(message) {
     cache_root_not_writable: '缓存目录不可写',
     cache_root_prepare_failed: '缓存目录初始化失败',
     scan_running: '已有扫描任务在运行',
+    scan_not_running: '当前没有运行中的扫描/转码任务',
+    scan_not_paused: '当前任务未暂停',
+    scan_abort_already_requested: '已请求中断，正在停止任务',
+    scan_control_invalid_action: '无效的任务控制动作',
     panel_update_running: '已有更新任务在运行',
   };
   const readable = map[code] || code;
@@ -603,6 +616,10 @@ function scanMessageText(code) {
   const map = {
     idle: '空闲',
     running: '运行中',
+    pausing: '暂停请求中',
+    paused: '已暂停',
+    aborting: '中断请求中',
+    aborted: '已中断',
     completed: '完成',
     completed_with_limit: '完成（达到限额）',
     completed_no_match: '完成（无匹配项目）',
@@ -617,8 +634,18 @@ function scanStopReasonText(code) {
     no_album_matched: '没有匹配到任何项目（检查年份/项目路径筛选）',
     max_scan_albums_per_run: '触发项目数量上限',
     time_budget_seconds: '触发时间上限',
+    aborted_by_user: '管理员手动中断任务',
     exception: '扫描异常',
     stale_scan_lock_recovered: '检测到旧扫描任务异常中断，已自动恢复',
+  };
+  return map[String(code || '')] || String(code || '-');
+}
+
+function scanPhaseText(code) {
+  const map = {
+    idle: '空闲',
+    scanning: '扫描中',
+    transcoding: '转码中',
   };
   return map[String(code || '')] || String(code || '-');
 }
@@ -1069,9 +1096,80 @@ async function saveAcl() {
   alert('ACL 已保存');
 }
 
+function setScanControlButtons(s) {
+  const running = !!s.running;
+  const paused = !!s.paused;
+  const pauseRequested = !!s.pause_requested;
+  const abortRequested = !!s.abort_requested;
+  const busyAction = String(state.scanControlBusyAction || '');
+
+  const startBtn = qs('start-scan-btn');
+  const pauseBtn = qs('pause-scan-btn');
+  const resumeBtn = qs('resume-scan-btn');
+  const abortBtn = qs('abort-scan-btn');
+
+  if (startBtn) {
+    startBtn.disabled = running || !!busyAction;
+    startBtn.textContent = running ? '扫描进行中' : '启动扫描';
+  }
+  if (pauseBtn) {
+    pauseBtn.disabled = !running || paused || pauseRequested || abortRequested || !!busyAction;
+    pauseBtn.textContent = busyAction === 'pause'
+      ? '暂停请求中...'
+      : (pauseRequested && !paused ? '暂停中...' : '暂停任务');
+  }
+  if (resumeBtn) {
+    resumeBtn.disabled = !running || (!paused && !pauseRequested) || abortRequested || !!busyAction;
+    resumeBtn.textContent = busyAction === 'resume' ? '继续中...' : '继续任务';
+  }
+  if (abortBtn) {
+    abortBtn.disabled = !running || abortRequested || !!busyAction;
+    abortBtn.textContent = busyAction === 'abort'
+      ? '中断请求中...'
+      : (abortRequested ? '中断中...' : '中断任务');
+  }
+}
+
+async function sendScanControl(action) {
+  if (state.scanControlBusyAction) return;
+  state.scanControlBusyAction = action;
+  setScanControlButtons({
+    running: true,
+    paused: false,
+    pause_requested: action === 'pause',
+    abort_requested: action === 'abort',
+  });
+  try {
+    await api('/api/admin/albums/scan/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+  } catch (e) {
+    alert(`任务控制失败: ${normalizeApiError(e.message)}`);
+  } finally {
+    state.scanControlBusyAction = '';
+    await loadScanStatus().catch(() => {});
+  }
+}
+
+async function pauseScan() {
+  await sendScanControl('pause');
+}
+
+async function resumeScan() {
+  await sendScanControl('resume');
+}
+
+async function abortScan() {
+  if (!confirm('确认中断当前扫描与转码任务？该操作不可恢复。')) return;
+  await sendScanControl('abort');
+}
+
 async function startScan() {
-  const btn = qs('start-scan-btn');
-  if (btn) btn.disabled = true;
+  if (state.scanControlBusyAction) return;
+  state.scanControlBusyAction = 'start';
+  setScanControlButtons({ running: true, paused: false, pause_requested: false, abort_requested: false });
   state.transcodeModalManuallyClosed = false;
   try {
     const years = qs('scan_years').value
@@ -1097,7 +1195,8 @@ async function startScan() {
   } catch (e) {
     alert(`启动扫描失败: ${normalizeApiError(e.message)}`);
   } finally {
-    if (btn) btn.disabled = false;
+    state.scanControlBusyAction = '';
+    await loadScanStatus().catch(() => {});
   }
 }
 
@@ -1119,8 +1218,16 @@ function setProgress(fillId, textId, done, total, pct) {
 function renderTranscodeModal(s, transDone, transTotal, transPct) {
   const running = !!s.running;
   let stageText = '当前无转码队列';
-  if (running && transTotal > 0) {
+  if (s.abort_requested) {
+    stageText = '任务中断中...';
+  } else if (s.paused) {
+    stageText = '任务已暂停（扫描/转码）';
+  } else if (s.pause_requested && running) {
+    stageText = '任务暂停中（等待安全暂停点）';
+  } else if (running && transTotal > 0) {
     stageText = '转码任务运行中';
+  } else if (running && transTotal <= 0) {
+    stageText = '扫描运行中，等待转码队列';
   } else if (!running && transTotal > 0) {
     stageText = '转码任务已结束';
   }
@@ -1162,6 +1269,7 @@ function syncTranscodeModalAutoOpen(s, transTotal) {
 
 async function loadScanStatus() {
   const s = await api('/api/admin/scan-status');
+  setScanControlButtons(s);
 
   const scanTotal = s.scan_target_albums || s.found_albums || 0;
   const scanDone = s.scan_done_albums || ((s.processed_albums || 0) + (s.skipped_albums || 0));
@@ -1177,6 +1285,10 @@ async function loadScanStatus() {
 
   const lines = [];
   lines.push(`状态: ${scanMessageText(s.message || 'unknown')}${s.running ? ' (running)' : ''}`);
+  lines.push(`阶段: ${scanPhaseText(s.phase || (s.running ? 'scanning' : 'idle'))}`);
+  if (s.pause_requested && !s.paused) lines.push('控制: 已请求暂停，等待任务进入可暂停点');
+  if (s.paused) lines.push('控制: 任务已暂停，可点击“继续任务”恢复');
+  if (s.abort_requested) lines.push('控制: 已请求中断，正在停止任务');
   if (s.scan_lock_running && !s.running) lines.push('提示: 扫描锁仍占用，系统会自动释放过期锁');
   lines.push(`开始: ${s.started_at ? new Date(s.started_at * 1000).toLocaleString() : '-'}`);
   lines.push(`结束: ${s.finished_at ? new Date(s.finished_at * 1000).toLocaleString() : '-'}`);
